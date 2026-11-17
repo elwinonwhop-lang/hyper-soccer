@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hyper Soccer Ultimate</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: #0d1117;
+      color: #f0f6fc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      min-height: 100vh;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 2rem;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      background: linear-gradient(90deg, #3b82f6, #ef4444);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      color: #8b949e;
+      font-size: 0.9rem;
+      margin-top: 4px;
+    }
+
+    /* Responsive container locked to your 1200x700 (12:7) aspect ratio */
+    .game-wrapper {
+      width: 100%;
+      max-width: 1200px;
+      aspect-ratio: 1200 / 700;
+      background: #000;
+      border: 3px solid #30363d;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
+    }
+
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+
+    /* Controls Section */
+    .controls-container {
+      width: 100%;
+      max-width: 1200px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 16px;
+      margin-top: 20px;
+    }
+
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .card h2 {
+      font-size: 1.1rem;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 2px solid;
+    }
+
+    .blue-title {
+      color: #60a5fa;
+      border-color: #3b82f6;
+    }
+
+    .red-title {
+      color: #f87171;
+      border-color: #ef4444;
+    }
+
+    .touch-title {
+      color: #34d399;
+      border-color: #10b981;
+    }
+
+    .control-list {
+      list-style: none;
+    }
+
+    .control-list li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 0.95rem;
+      border-bottom: 1px solid #21262d;
+    }
+
+    .control-list li:last-child {
+      border-bottom: none;
+    }
+
+    kbd {
+      background: #21262d;
+      border: 1px solid #484f58;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-family: monospace;
+      font-size: 0.85rem;
+      color: #e6edf3;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Hyper Soccer Ultimate</h1>
+    <p class="subtitle">Click inside the game screen to activate keyboard &amp; audio</p>
+  </header>
+
+  <div class="game-wrapper">
+    <iframe src="build/web/index.html" allow="autoplay; fullscreen; gamepad" allowfullscreen></iframe>
+  </div>
+
+  <div class="controls-container">
+    <!-- Blue Player Controls -->
+    <div class="card">
+      <h2 class="blue-title">Blue Player (Player 1)</h2>
+      <ul class="control-list">
+        <li><span>Move</span> <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></li>
+        <li><span>Shoot</span> <kbd>E</kbd></li>
+        <li><span>Tackle</span> <kbd>R</kbd></li>
+        <li><span>Dash</span> <kbd>Left Shift</kbd></li>
+      </ul>
+    </div>
+
+    <!-- Red Player Controls -->
+    <div class="card">
+      <h2 class="red-title">Red Player (Player 2)</h2>
+      <ul class="control-list">
+        <li><span>Move</span> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></li>
+        <li><span>Shoot</span> <kbd>P</kbd></li>
+        <li><span>Tackle</span> <kbd>L</kbd></li>
+        <li><span>Dash</span> <kbd>Right Shift</kbd> / <kbd>/</kbd></li>
+      </ul>
+    </div>
+
+    <!-- Touchscreen Controls -->
+    <div class="card">
+      <h2 class="touch-title">Touchscreen / Mobile</h2>
+      <ul class="control-list">
+        <li><span>D-Pad</span> <span>Move player</span></li>
+        <li><span>SHOOT</span> <span>Hold to charge</span></li>
+        <li><span>TACKLE</span> <span>Challenge opponent</span></li>
+        <li><span>DASH</span> <span>Quick acceleration</span></li>
+      </ul>
+    </div>
+  </div>
+
+</body>
+</html>

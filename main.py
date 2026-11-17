@@ -1,22 +1,18 @@
-"""
-HYPER SOCCER  -  1v1 arcade soccer for two players, vs a bot, or online.
-
-Run in Thonny:  Tools > Manage packages > install "pygame", then press F5.
-Run anywhere:   pip install pygame   then   python hyper_soccer_ultimate.py
-
-Needs only pygame (2.0 or newer). All sounds are generated in code,
-so there are no extra files to download. The game also runs silently
-if your computer has no audio device.
-"""
+import asyncio
 import pygame
 import sys
 import math
 import random
-import socket
 import json
+import os
 import time
-import threading
 from array import array
+
+WEB_BUILD = sys.platform == "emscripten"
+
+if not WEB_BUILD:
+  import socket
+  import threading
 
 if int(pygame.version.ver.split(".")[0]) < 2:
     print("Hyper Soccer needs pygame 2 or newer.  Install it with:  pip install --upgrade pygame")
@@ -49,7 +45,7 @@ PROTO = 2            # bump when the network protocol changes
 MAGIC = "HSOC"
 INTERP_DELAY = 0.07  # seconds the guest renders behind the host (smooths jitter)
 
-MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize")
+MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades")
 GAME_STATES = ("countdown", "play", "goal", "finished")
 STATE_IDX = {"countdown": 0, "play": 1, "goal": 2, "finished": 3}
 IDX_STATE = {v: k for k, v in STATE_IDX.items()}
@@ -74,10 +70,14 @@ BOT_LEVELS = [
      "tackle": 0.100, "tk_range": 74, "fumble": 0.0003, "dash": True, "seek_pu": True},
 ]
 
-try:
+if WEB_BUILD:
+  screen = pygame.display.set_mode((W, H))
+else:
+  try:
     screen = pygame.display.set_mode((W, H), pygame.SCALED, vsync=1)
-except Exception:
+  except Exception:
     screen = pygame.display.set_mode((W, H))
+
 pygame.display.set_caption("Hyper Soccer 1v1")
 clock = pygame.time.Clock()
 
@@ -117,6 +117,10 @@ KITS = (
     ("SUNSET", (255, 145, 35), (145, 60, 12), (255, 205, 100), (255, 245, 210)),
     ("PINK NOVA", (255, 70, 190), (135, 20, 95), (255, 155, 220), (255, 240, 250)),
     ("STEALTH GOLD", (175, 155, 95), (65, 55, 30), (230, 210, 140), (255, 240, 175)),
+    ("MIDNIGHT", (45, 55, 85), (12, 18, 35), (115, 150, 220), (205, 225, 255)),
+    ("LIME PULSE", (95, 245, 80), (25, 100, 30), (180, 255, 145), (245, 255, 220)),
+    ("ICE WHITE", (220, 238, 255), (95, 125, 155), (255, 255, 255), (90, 205, 255)),
+    ("MINT", (85, 235, 160), (25, 105, 75), (170, 255, 210), (235, 255, 245)),
 )
 
 # ============================================================
@@ -244,6 +248,10 @@ class Sound:
         self.snd = {}
         self.rate = 22050
         self.channels = 1
+        self.music_enabled = True
+        self.music_tracks = {}
+        self.music_channel = None
+        self.current_music = None
         try:
             if not pygame.mixer.get_init():
                 try:
@@ -255,6 +263,8 @@ class Sound:
                 return
             self.rate, _, self.channels = info
             pygame.mixer.set_num_channels(16)
+            # Reserve one dedicated channel so effects never interrupt the soundtrack.
+            self.music_channel = pygame.mixer.Channel(15)
             self.build()
             self.ok = True
         except Exception:
@@ -333,6 +343,173 @@ class Sound:
         melody = [(0.00, 523), (0.14, 659), (0.28, 784), (0.42, 659), (0.64, 1047)]
         s["win"] = mk(self.mix([(off, r(0.26, f, None, 0.3, 2.5, partials=((1, 1.0), (2, 0.3))))
                                 for off, f in melody]))
+        self.build_music_tracks()
+
+    def build_music_tracks(self):
+        """Create original soccer-anthem loops procedurally; no copyrighted or external audio."""
+        rate = self.rate
+        tau = math.tau
+
+        # A relaxed stadium warm-up for menus and a fast, chant-like sports anthem in matches.
+        # Both loops contain exactly four bars, so each downbeat lands cleanly on the loop.
+        settings = {
+            "menu": {
+                "bpm": 112.0,
+                "chords": [(57, 60, 64), (53, 57, 60), (55, 59, 62), (52, 55, 59)],
+                "melody": [(76, None, 79, 81), (77, None, 81, 84),
+                           (79, 76, 72, 76), (74, None, 79, 83)],
+                "energy": 0.72,
+            },
+            "match": {
+                "bpm": 150.0,
+                # Bright, stadium-anthem harmony with a rising finish.
+                "chords": [(48, 55, 60), (45, 52, 57), (41, 48, 53), (43, 50, 55)],
+                "melody": [(76, None, 79, 81), (74, None, 77, 79),
+                           (72, 76, 79, 76), (74, 77, 81, 84)],
+                "energy": 1.0,
+            },
+        }
+
+        def hz(midi_note):
+            return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+
+        for style, cfg in settings.items():
+            bpm = cfg["bpm"]
+            chords = cfg["chords"]
+            melody = cfg["melody"]
+            energy = cfg["energy"]
+            duration = 16.0 * 60.0 / bpm  # four 4/4 bars, looped continuously
+            total = int(rate * duration)
+            samples = array("h")
+
+            for i in range(total):
+                t = i / rate
+                beat = t * bpm / 60.0
+                beat_index = int(beat)
+                beat_phase = beat - beat_index
+                beat_in_bar = beat_index % 4
+                bar = (beat_index // 4) % 4
+                chord = chords[bar]
+                previous_chord = chords[(bar - 1) % 4]
+                bar_phase = beat % 4.0
+                blend = min(1.0, bar_phase / 0.18)
+
+                # Stadium-sized chord bed: warm low notes with a brighter octave above.
+                pad = 0.0
+                for voice, midi_note in enumerate(chord):
+                    f = hz(midi_note)
+                    pf = hz(previous_chord[voice])
+                    current = math.sin(tau * f * t) * 0.72 + math.sin(tau * f * 2.0 * t) * 0.18
+                    previous = math.sin(tau * pf * t) * 0.72 + math.sin(tau * pf * 2.0 * t) * 0.18
+                    pad += previous * (1.0 - blend) + current * blend
+                pad *= 0.046 * energy
+
+                # Bouncy, moving bass line keeps the pulse driving forward.
+                root = chord[0]
+                bass_freq = hz(root - 12)
+                bass_gate = 0.80 + 0.20 * (1.0 - beat_phase)
+                bass = math.sin(tau * bass_freq * t) * 0.14 * bass_gate
+                bass += math.sin(tau * bass_freq * 2.0 * t) * 0.035 * bass_gate
+                if style == "match":
+                    bass += math.sin(tau * hz(root - 24) * t) * 0.045 * bass_gate
+
+                # Big kick drum on the beat, with extra weight on beats 1 and 3.
+                kick = 0.0
+                kick_weight = (1.0 if beat_in_bar in (0, 2) else (0.62 if style == "match" else 0.28))
+                if beat_phase < 0.19:
+                    k_env = math.exp(-beat_phase * (25.0 if style == "match" else 20.0))
+                    k_freq = 105.0 - 58.0 * min(1.0, beat_phase / 0.19)
+                    kick = math.sin(tau * k_freq * t) * k_env * 0.22 * kick_weight * energy
+                    kick += math.sin(tau * 48.0 * t) * k_env * 0.06 * kick_weight * energy
+
+                # Claps/snare on beats 2 and 4 give the match a crowd-stomp rhythm.
+                snare = 0.0
+                if style == "match" and beat_in_bar in (1, 3) and beat_phase < 0.085:
+                    s_env = math.exp(-beat_phase * 62.0)
+                    snap = (math.sin(tau * 1703.0 * t) + 0.68 * math.sin(tau * 2513.0 * t)
+                            + 0.42 * math.sin(tau * 3691.0 * t))
+                    clap = math.sin(tau * 225.0 * t) + 0.45 * math.sin(tau * 510.0 * t)
+                    snare = (snap * 0.035 + clap * 0.045) * s_env
+
+                # Bright hi-hat on every eighth note adds movement without becoming harsh.
+                hat = 0.0
+                eighth_phase = (beat * 2.0) % 1.0
+                if style == "match" and eighth_phase < 0.045:
+                    h_env = math.exp(-eighth_phase * 105.0)
+                    metal = (math.sin(tau * 5231.0 * t) + 0.65 * math.sin(tau * 6817.0 * t)
+                             + 0.40 * math.sin(tau * 8123.0 * t))
+                    hat = metal * h_env * 0.012
+
+                # Synth-brass stabs on bar starts: the little fanfare gives it a football-anthem feel.
+                brass = 0.0
+                if beat_in_bar == 0 and beat_phase < 0.24:
+                    b_env = min(1.0, beat_phase * 42.0) * math.exp(-beat_phase * 7.0)
+                    for n in chord[1:]:
+                        f = hz(n + 12)
+                        tone = (math.sin(tau * f * t) + 0.43 * math.sin(tau * f * 2.0 * t)
+                                + 0.20 * math.sin(tau * f * 3.0 * t))
+                        brass += tone * b_env * (0.050 if style == "match" else 0.032)
+
+                # A synthetic crowd "oh-oh" chant, made from layered harmonics rather than a sample.
+                chant = 0.0
+                chant_beats = (0, 2) if style == "match" else (0,)
+                if beat_in_bar in chant_beats and beat_phase < 0.47:
+                    c_env = min(1.0, beat_phase * 13.0) * math.exp(-beat_phase * 1.25)
+                    chant_note = chord[1] + 12
+                    f = hz(chant_note)
+                    choir = (math.sin(tau * f * t) + 0.56 * math.sin(tau * f * 2.01 * t)
+                             + 0.30 * math.sin(tau * f * 3.02 * t)
+                             + 0.16 * math.sin(tau * hz(chant_note + 7) * t))
+                    chant = choir * c_env * (0.045 if style == "match" else 0.025)
+
+                # A short, melodic hook between drum hits.
+                lead = 0.0
+                note = melody[bar][beat_in_bar]
+                gate = 0.28 if style == "match" else 0.34
+                if note is not None and beat_phase < gate:
+                    lead_env = min(1.0, beat_phase * 36.0) * math.exp(-beat_phase * (6.5 if style == "match" else 5.5))
+                    f = hz(note)
+                    lead_wave = math.sin(tau * f * t) + 0.32 * math.sin(tau * f * 2.0 * t)
+                    if style == "match":
+                        lead_wave += 0.14 * math.sin(tau * f * 3.0 * t)
+                    lead = lead_wave * lead_env * (0.105 if style == "match" else 0.075)
+
+                value = (pad + bass + kick + snare + hat + brass + chant + lead) * 0.90
+                # Gentle edge fade protects against clicks at the loop seam.
+                edge_len = max(1.0, rate * 0.018)
+                edge = min(1.0, i / edge_len, (total - 1 - i) / edge_len)
+                value *= edge
+                samples.append(int(max(-1.0, min(1.0, value)) * 30000))
+
+            snd = pygame.mixer.Sound(buffer=samples.tobytes())
+            snd.set_volume(1.0)
+            self.music_tracks[style] = snd
+
+    def set_music(self, track):
+        """Start/restart the requested background loop when the game screen changes."""
+        if not self.ok or self.music_channel is None:
+            return
+        if not self.music_enabled:
+            if self.music_channel.get_busy():
+                self.music_channel.stop()
+            self.current_music = None
+            return
+        if track not in self.music_tracks:
+            return
+        if self.current_music != track or not self.music_channel.get_busy():
+            try:
+                self.music_channel.play(self.music_tracks[track], loops=-1, fade_ms=650)
+                self.current_music = track
+            except pygame.error:
+                self.current_music = None
+                return
+        self.music_channel.set_volume(0.20 if track == "menu" else 0.32)
+
+    def toggle_music(self):
+        self.music_enabled = not self.music_enabled
+        if not self.music_enabled and self.music_channel is not None:
+            self.music_channel.stop()
+            self.current_music = None
 
     def play(self, name, vol=1.0):
         if not (self.ok and self.on):
@@ -589,6 +766,7 @@ class Player:
         self.light_color = light_color
         self.accent_color = light_color
         self.kit_name = "CUSTOM"
+        self.shape = "ROUND"
         self.is_p2 = is_p2
 
         self.radius = 25
@@ -596,6 +774,11 @@ class Player:
         self.vx = 0.0
         self.vy = 0.0
         self.max_speed = 6.2
+        # Persistent career upgrades are applied by Game to the main player.
+        self.shooting_level = 0
+        self.pace_level = 0
+        self.defending_level = 0
+        self.celebration_timer = 0.0
 
         self.stamina = 100.0
         self.max_stamina = 100.0
@@ -632,12 +815,14 @@ class Player:
     def tackle(self):
         if self.tackle_cooldown > 0 or self.tackle_timer > 0 or self.frozen_t > 0:
             return False
-        self.tackle_timer = 12.0
-        self.tackle_cooldown = 42.0
+        defense = int(getattr(self, "defending_level", 0))
+        self.tackle_timer = 12.0 + defense * 1.2
+        self.tackle_cooldown = max(26.0, 42.0 - defense * 2.4)
         fx, fy = normalize(self.facing_x, self.facing_y,
                            (-1.0 if self.is_p2 else 1.0, 0.0))
-        self.vx += fx * 7.5
-        self.vy += fy * 7.5
+        tackle_power = 7.5 + int(getattr(self, "defending_level", 0)) * 0.35
+        self.vx += fx * tackle_power
+        self.vy += fy * tackle_power
         return True
 
     def tick_timers(self, dt):
@@ -648,6 +833,7 @@ class Player:
         self.tackle_timer = max(0.0, self.tackle_timer - dt)
         self.tackle_cooldown = max(0.0, self.tackle_cooldown - dt)
         self.flash_timer = max(0.0, self.flash_timer - dt)
+        self.celebration_timer = max(0.0, self.celebration_timer - dt)
         self.boost_t = max(0.0, self.boost_t - dt)
         self.mega_t = max(0.0, self.mega_t - dt)
         self.frozen_t = max(0.0, self.frozen_t - dt)
@@ -748,14 +934,52 @@ class Player:
             int(self.y - body_h / 2 + bounce),
             body_w, body_h)
 
-        if self.flash_timer > 0:
-            pygame.draw.ellipse(surface, GOLD, body_rect.inflate(11, 11))
-        pygame.draw.ellipse(surface, self.dark_color, body_rect.inflate(5, 5))
-        pygame.draw.ellipse(surface, self.color, body_rect)
+        # Body silhouette is player-customizable: each shape gets a contrasting outline.
+        body_shape_rect = body_rect.inflate(5, 5)
+        def silhouette(rect):
+            cx, cy = rect.center
+            left, right, top, bottom = rect.left, rect.right, rect.top, rect.bottom
+            if self.shape == "SQUARE":
+                return "rect", rect, 9
+            if self.shape == "DIAMOND":
+                return "poly", [(cx, top), (right, cy), (cx, bottom), (left, cy)], 0
+            if self.shape == "HEXAGON":
+                return "poly", [(left + rect.w * .25, top), (right - rect.w * .25, top),
+                                 (right, cy), (right - rect.w * .25, bottom),
+                                 (left + rect.w * .25, bottom), (left, cy)], 0
+            if self.shape == "STAR":
+                pts = []
+                for i in range(10):
+                    ang = -math.pi / 2 + i * math.pi / 5
+                    rad = (0.52 if i % 2 == 0 else 0.25)
+                    pts.append((cx + math.cos(ang) * rect.w * rad,
+                                cy + math.sin(ang) * rect.h * rad))
+                return "poly", pts, 0
+            if self.shape == "SHIELD":
+                return "poly", [(left + rect.w * .12, top), (right - rect.w * .12, top),
+                                 (right, top + rect.h * .52), (cx, bottom),
+                                 (left, top + rect.h * .52)], 0
+            return "ellipse", rect, 0
 
+        for rect, col, stroke in ((body_shape_rect, self.dark_color, False),
+                                  (body_rect, self.color, True)):
+            kind, geo, radius = silhouette(rect)
+            if self.flash_timer > 0 and not stroke:
+                pygame.draw.ellipse(surface, GOLD, body_rect.inflate(11, 11))
+            if kind == "ellipse":
+                pygame.draw.ellipse(surface, col, geo)
+            elif kind == "rect":
+                pygame.draw.rect(surface, col, geo, border_radius=radius)
+            else:
+                pygame.draw.polygon(surface, col, geo)
         highlight = pygame.Rect(body_rect.x + 6, body_rect.y + 5,
                                 max(4, body_rect.w // 3), max(5, body_rect.h // 3))
-        pygame.draw.ellipse(surface, self.light_color, highlight)
+        if self.shape in ("ROUND", "SQUARE"):
+            pygame.draw.ellipse(surface, self.light_color, highlight)
+        else:
+            pygame.draw.circle(surface, self.light_color,
+                               (int(self.x - body_w * .13), int(self.y - body_h * .18 + bounce)),
+                               max(4, int(self.radius * .18)))
         # Contrasting kit stripe and collar make each custom uniform readable in motion.
         stripe_y = int(self.y + bounce)
         pygame.draw.line(surface, self.accent_color,
@@ -763,6 +987,23 @@ class Player:
                          (int(self.x + body_w * 0.27), stripe_y), max(3, int(self.radius * 0.22)))
         pygame.draw.circle(surface, self.accent_color,
                            (int(self.x), int(self.y - body_h * 0.28 + bounce)), 3)
+
+        # Goal celebration: both arms rise and wave while the player hops.
+        fx, fy = self.facing_x, self.facing_y
+        perp_x, perp_y = -fy, fx
+        if self.celebration_timer > 0:
+            wave = math.sin(self.animation_time * 0.42) * 5
+            lift = 19 + abs(math.sin(self.animation_time * 0.28)) * 8
+            for side in (-1, 1):
+                shoulder = (int(self.x + side * 12), int(self.y + bounce - 5))
+                hand = (int(self.x + side * 27 + wave * side),
+                        int(self.y + bounce - lift - 8))
+                elbow = (int(self.x + side * 21), int(self.y + bounce - lift * 0.48))
+                pygame.draw.line(surface, self.dark_color, shoulder, elbow, 9)
+                pygame.draw.line(surface, self.light_color, shoulder, elbow, 6)
+                pygame.draw.line(surface, self.dark_color, elbow, hand, 8)
+                pygame.draw.line(surface, self.light_color, elbow, hand, 5)
+                pygame.draw.circle(surface, WHITE, hand, 5)
 
         fx, fy = self.facing_x, self.facing_y
         face_x = self.x + fx * 8
@@ -873,6 +1114,8 @@ class SoccerBall:
         self.rotation = 0.0
         self.trail = []
         self.post_hit = False
+        self.last_shot_origin = None
+        self.last_shot_side = None
 
     def give_to(self, player):
         if self.owner and self.owner is not player:
@@ -985,12 +1228,15 @@ class SoccerBall:
         """Returns True if a kick actually happened."""
         speed_p = math.hypot(player.vx, player.vy)
         if self.owner is player:
+            self.last_shot_origin = (float(player.x), float(player.y))
+            self.last_shot_side = 2 if player.is_p2 else 1
             self.release_owner()
             fx, fy = normalize(player.facing_x, player.facing_y,
                                (-1.0 if player.is_p2 else 1.0, 0.0))
             self.x = player.x + fx * 34
             self.y = player.y + fy * 34
             power = 15.5 + charge * 8.5 + min(3, speed_p * 0.35)
+            power *= 1.0 + int(getattr(player, "shooting_level", 0)) * 0.08
             if player.mega_t > 0:
                 power *= 1.35
             self.vx = fx * power + player.vx * 0.25
@@ -1004,6 +1250,8 @@ class SoccerBall:
             dist = math.hypot(dx, dy)
             if dist > 68:
                 return False
+            self.last_shot_origin = (float(player.x), float(player.y))
+            self.last_shot_side = 2 if player.is_p2 else 1
             if dist < 0.001:
                 dx, dy = player.facing_x, player.facing_y
                 dist = max(0.001, math.hypot(dx, dy))
@@ -1014,13 +1262,14 @@ class SoccerBall:
                 ny = ny * 0.55 + player.facing_y / fl * 0.45
                 nx, ny = normalize(nx, ny)
             power = 14.5 + charge * 8.0 + min(3.5, speed_p * 0.4)
+            power *= 1.0 + int(getattr(player, "shooting_level", 0)) * 0.08
             if player.mega_t > 0:
                 power *= 1.35
             self.vx = nx * power + player.vx * 0.18
             self.vy = ny * power + player.vy * 0.18
 
         sp = math.hypot(self.vx, self.vy)
-        cap = self.MAX_SPEED * (1.3 if player.mega_t > 0 else 1.0)
+        cap = self.MAX_SPEED * (1.0 + int(getattr(player, "shooting_level", 0)) * 0.07) * (1.3 if player.mega_t > 0 else 1.0)
         if sp > cap:
             self.vx = self.vx / sp * cap
             self.vy = self.vy / sp * cap
@@ -1043,7 +1292,8 @@ class SoccerBall:
         dy = self.y - player.y
         dist = math.hypot(dx, dy)
 
-        if player.tackle_timer > 0 and self.owner and self.owner is not player and dist < 80:
+        tackle_range = 80 + int(getattr(player, "defending_level", 0)) * 7
+        if player.tackle_timer > 0 and self.owner and self.owner is not player and dist < tackle_range:
             self.give_to(player)
             self.possession_lock = 10.0
             return "steal"
@@ -1131,12 +1381,34 @@ class Game:
         self.bot_state = {"think": 0.0, "tx": W * 0.7, "ty": FIELD_CY, "lull": 0.0}
 
         self.running = True
+        self.touch_held = set()
+        self.touch_pointer_map = {}
         self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 1}
         self.sound = Sound()
+        self.profile = self.load_profile()
+        self.upgrade_keys = ("shooting", "pace", "defending")
+        self.upgrade_titles = ("SHOOTING POWER", "PACE", "DEFENDING")
+        self.upgrade_descriptions = (
+            "Faster shots and a higher shot-speed cap",
+            "Move quicker and close down the ball faster",
+            "Stronger tackles with a wider steal range",
+        )
+        self.upgrade_rects = [pygame.Rect(64 + i * 365, 205, 342, 286) for i in range(3)]
+        self.upgrade_back_rect = pygame.Rect(W // 2 - 105, 548, 210, 48)
+        self.upgrades_return_state = "menu"
+        self.shop_message = ""
+        self.shop_message_timer = 0.0
+        self.coin_message = ""
+        self.coin_timer = 0.0
+        self.last_match_reward = ""
+        self.match_rewarded = False
         self.set_sel = 0
         self.settings_rect = pygame.Rect(W - 200, 22, 170, 46)
         self.customize_rect = pygame.Rect(30, 22, 190, 46)
+        self.upgrade_rect = pygame.Rect(30, 80, 190, 46)
         self.kit_indices = [0, 1]
+        self.shape_indices = [0, 0]
+        self.shape_options = ("ROUND", "SQUARE", "DIAMOND", "HEXAGON", "STAR", "SHIELD")
         self.powerups = []
         self.pu_timer = 300.0
         self.overtime = False
@@ -1174,6 +1446,26 @@ class Game:
         self.p2_tk_prev = 0
         self.ev_log = []
         self.ev_id = 0
+        self.goal_history = []
+        self.highlight_video_rect = pygame.Rect(W // 2 - 269, H - 62, 170, 42)
+        self.highlight_rematch_rect = pygame.Rect(W // 2 - 85, H - 62, 170, 42)
+        self.highlight_menu_rect = pygame.Rect(W // 2 + 99, H - 62, 170, 42)
+        self.highlight_upgrade_rect = pygame.Rect(W // 2 + 282, H - 62, 170, 42)
+
+        # In-game highlight-video recorder. Frames are sampled during live play;
+        # each goal stores the few seconds leading up to the shot as a replay clip.
+        self.replay_buffer = []
+        self.replay_capture_accum = 0.0
+        self.goal_replays = []
+        self.replay_clip_i = 0
+        self.replay_cursor = 0.0
+        self.replay_playing = True
+        self.replay_hold = 0.0
+        self.replay_actor1 = None
+        self.replay_actor2 = None
+        self.replay_back_rect = pygame.Rect(36, H - 58, 190, 38)
+        self.replay_pause_rect = pygame.Rect(W // 2 - 88, H - 58, 176, 38)
+        self.replay_next_rect = pygame.Rect(W - 226, H - 58, 190, 38)
         self.last_ev = 0
         self.snap_buf = []
         self.clock_off = None
@@ -1203,12 +1495,16 @@ class Game:
         self.penalty_wait = 0.0
         self.penalty_finished = False
         self.penalty_winner = None
+        self.penalty_report_delay = 0.0
 
         self.reset_positions()
         self.menu_p1 = Player(0, 0, BLUE, BLUE_DARK, BLUE_LIGHT, False)
         self.menu_p2 = Player(0, 0, RED, RED_DARK, RED_LIGHT, True)
         self.apply_kit(self.menu_p1, self.kit_indices[0])
         self.apply_kit(self.menu_p2, self.kit_indices[1])
+        self.apply_shape(self.menu_p1, self.shape_indices[0])
+        self.apply_shape(self.menu_p2, self.shape_indices[1])
+        self.apply_profile_to_player(self.menu_p1)
 
     # --------------------------------------------------------
     # STATE
@@ -1220,10 +1516,127 @@ class Game:
         player.color, player.dark_color, player.light_color = main, dark, light
         player.accent_color = accent
 
+    def apply_shape(self, player, index):
+        player.shape = self.shape_options[index % len(self.shape_options)]
+
+    def load_profile(self):
+        """Load a tiny local career save; defaults give a new player 60 coins."""
+        profile = {
+            "coins": 60,
+            "upgrades": {"shooting": 0, "pace": 0, "defending": 0},
+            "total_goals": 0,
+            "wins": 0,
+            "matches": 0,
+        }
+        self.profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "hyper_soccer_profile.json")
+        try:
+            with open(self.profile_path, "r", encoding="utf-8") as save:
+                stored = json.load(save)
+            if not isinstance(stored, dict):
+                raise ValueError("Invalid career save format")
+            profile["coins"] = max(0, int(stored.get("coins", profile["coins"])))
+            profile["total_goals"] = max(0, int(stored.get("total_goals", 0)))
+            profile["wins"] = max(0, int(stored.get("wins", 0)))
+            profile["matches"] = max(0, int(stored.get("matches", 0)))
+            saved_upgrades = stored.get("upgrades", {})
+            if not isinstance(saved_upgrades, dict):
+                saved_upgrades = {}
+            for key in profile["upgrades"]:
+                profile["upgrades"][key] = int(clamp(int(saved_upgrades.get(key, 0)), 0, 5))
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            pass
+        return profile
+
+    def save_profile(self):
+        try:
+            with open(self.profile_path, "w", encoding="utf-8") as save:
+                json.dump(self.profile, save, indent=2)
+        except OSError:
+            # The game can still be played if the folder is read-only.
+            self.shop_message = "Could not save career data in this folder."
+            self.shop_message_timer = 120.0
+
+    def apply_profile_to_player(self, player):
+        # Career boosts are intentionally disabled in network matches so both
+        # connected players keep identical movement and shot physics.
+        levels = ({} if self.mode in ("host", "client") else self.profile["upgrades"])
+        player.shooting_level = int(levels.get("shooting", 0))
+        player.pace_level = int(levels.get("pace", 0))
+        player.defending_level = int(levels.get("defending", 0))
+        player.max_speed = 6.2 + player.pace_level * 0.38
+
+    def upgrade_cost(self, key):
+        level = int(self.profile["upgrades"].get(key, 0))
+        base, step = {"shooting": (55, 45), "pace": (50, 40), "defending": (50, 42)}[key]
+        return base + level * step
+
+    def open_upgrades(self, return_state=None):
+        self.upgrades_return_state = return_state or self.state
+        self.state = "upgrades"
+        self.sound.play("menuok")
+
+    def buy_upgrade(self, index):
+        if not 0 <= index < len(self.upgrade_keys):
+            return
+        key = self.upgrade_keys[index]
+        level = int(self.profile["upgrades"].get(key, 0))
+        if level >= 5:
+            self.shop_message = f"{self.upgrade_titles[index]} IS MAXED OUT!"
+            self.shop_message_timer = 95.0
+            self.sound.play("click")
+            return
+        cost = self.upgrade_cost(key)
+        if self.profile["coins"] < cost:
+            self.shop_message = f"NOT ENOUGH COINS — NEED {cost - self.profile['coins']} MORE."
+            self.shop_message_timer = 110.0
+            self.sound.play("click")
+            return
+        self.profile["coins"] -= cost
+        self.profile["upgrades"][key] = level + 1
+        self.apply_profile_to_player(self.p1)
+        self.apply_profile_to_player(self.menu_p1)
+        self.save_profile()
+        self.shop_message = f"UPGRADE BOUGHT: {self.upgrade_titles[index]}  LV {level + 1}!"
+        self.shop_message_timer = 120.0
+        self.sound.play("pickup")
+        for _ in range(20):
+            self.particles.append(Particle(W // 2, 178, random.uniform(-4, 4),
+                random.uniform(-5, 1), GOLD, random.randint(2, 4), random.randint(24, 38)))
+
+    def events_upgrades(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for i, rect in enumerate(self.upgrade_rects):
+                if rect.collidepoint(event.pos):
+                    self.buy_upgrade(i)
+                    return
+            if self.upgrade_back_rect.collidepoint(event.pos):
+                self.state = self.upgrades_return_state
+                self.sound.play("click")
+        elif event.type == pygame.KEYDOWN:
+            k = event.key
+            if k in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.state = self.upgrades_return_state
+                self.sound.play("click")
+            elif k in (pygame.K_1, pygame.K_KP1):
+                self.buy_upgrade(0)
+            elif k in (pygame.K_2, pygame.K_KP2):
+                self.buy_upgrade(1)
+            elif k in (pygame.K_3, pygame.K_KP3):
+                self.buy_upgrade(2)
+            elif k == pygame.K_n:
+                self.toggle_sound()
+
     def cycle_kit(self, side, delta):
         self.kit_indices[side] = (self.kit_indices[side] + delta) % len(KITS)
         for player in ((self.menu_p1, self.p1) if side == 0 else (self.menu_p2, self.p2)):
             self.apply_kit(player, self.kit_indices[side])
+        self.sound.play("menuok")
+
+    def cycle_shape(self, side, delta):
+        self.shape_indices[side] = (self.shape_indices[side] + delta) % len(self.shape_options)
+        for player in ((self.menu_p1, self.p1) if side == 0 else (self.menu_p2, self.p2)):
+            self.apply_shape(player, self.shape_indices[side])
         self.sound.play("menuok")
 
     def open_customize(self):
@@ -1235,6 +1648,9 @@ class Game:
         self.p2 = Player(FIELD_RIGHT - 180, FIELD_CY, RED, RED_DARK, RED_LIGHT, True)
         self.apply_kit(self.p1, self.kit_indices[0])
         self.apply_kit(self.p2, self.kit_indices[1])
+        self.apply_shape(self.p1, self.shape_indices[0])
+        self.apply_shape(self.p2, self.shape_indices[1])
+        self.apply_profile_to_player(self.p1)
         self.ball = SoccerBall(W // 2, FIELD_CY)
         self.powerups = []
         self.bot_state.update({"think": 20.0, "lull": 0.0})
@@ -1252,6 +1668,24 @@ class Game:
         self.match_duration = self.settings["len"] * 60.0
         self.overtime = False
         self.stats = self.new_stats()
+        self.match_rewarded = False
+        self.coin_message = ""
+        self.coin_timer = 0.0
+        self.last_match_reward = ""
+        self.goal_history = []
+        self.replay_buffer = []
+        self.replay_capture_accum = 0.0
+        self.goal_replays = []
+        self.replay_clip_i = 0
+        self.replay_cursor = 0.0
+        self.replay_playing = True
+        self.replay_hold = 0.0
+        self.penalty_standalone = False
+        self.penalty_scores = [0, 0]
+        self.penalty_taken = [0, 0]
+        self.penalty_finished = False
+        self.penalty_winner = None
+        self.penalty_report_delay = 0.0
         self.pu_timer = 300.0
         self.goal_timer = 0.0
         self.goal_flash = 0.0
@@ -1744,6 +2178,7 @@ class Game:
             self.snap_buf.clear()
             self.clock_off = None
             self.particles.clear()
+            self.goal_history = []
             self.fade = 255.0
             self.c_shoot = False
             evs = msg.get("ev") or []
@@ -1801,7 +2236,18 @@ class Game:
         elif typ == "pu":
             self.pu_burst(x, y, int(ex) % 10, int(ex) // 10)
         elif typ == "goal":
-            self.goal_fx(x, y, int(ex))
+            side = int(ex)
+            self.goal_fx(x, y, side)
+            # Guests get the same replay clips as the host, built from their
+            # interpolated view of the network match.
+            if self.replay_buffer:
+                self.goal_replays.append({
+                    "side": side,
+                    "time": max(0.0, float(self.clock_frames) / 60.0),
+                    "frames": list(self.replay_buffer[-105:]),
+                })
+                if len(self.goal_replays) > 8:
+                    self.goal_replays.pop(0)
 
     def client_dust(self, p, dt):
         speed = math.hypot(p.vx, p.vy)
@@ -1914,6 +2360,9 @@ class Game:
         elif ball.trail:
             ball.trail.pop(0)
 
+        if self.state == "play":
+            self.record_replay_frame(dt)
+
         if self.state == "finished" and random.random() < 0.5 * dt:
             self.spawn_confetti()
 
@@ -1938,7 +2387,19 @@ class Game:
                 self.running = False
                 return
 
+            # B toggles background music from every screen without changing gameplay controls.
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+                self.sound.toggle_music()
+                continue
+
             st = self.state
+            # SDL may deliver touch events without synthesizing mouse clicks on mobile.
+            # Convert menu taps to clicks; gameplay keeps native finger events for multitouch.
+            if WEB_BUILD and event.type == pygame.FINGERDOWN and st in (
+                    "menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades"):
+                event = pygame.event.Event(
+                    pygame.MOUSEBUTTONDOWN,
+                    {"pos": (int(event.x * W), int(event.y * H)), "button": 1})
             if st == "menu":
                 self.events_menu(event)
             elif st == "online_menu":
@@ -1951,6 +2412,8 @@ class Game:
                 self.events_settings(event)
             elif st == "customize":
                 self.events_customize(event)
+            elif st == "upgrades":
+                self.events_upgrades(event)
             elif st in ("penalties", "penalty_finished"):
                 self.events_penalties(event)
             else:
@@ -1962,7 +2425,10 @@ class Game:
         elif i == 1:
             self.start_match("bot")
         elif i == 2:
-            self.open_online_menu()
+            if WEB_BUILD:
+                self.net_msg = "Online party mode is not available in the browser build. Try 1 V 1 or 1 V BOT."
+            else:
+                self.open_online_menu()
         elif i == 3:
             self.start_penalty_shootout(standalone=True)
 
@@ -1979,12 +2445,16 @@ class Game:
                 self.open_settings()
             if self.customize_rect.collidepoint(event.pos):
                 self.open_customize()
+            if self.upgrade_rect.collidepoint(event.pos):
+                self.open_upgrades("menu")
         elif event.type == pygame.KEYDOWN:
             k = event.key
             if k == pygame.K_n:
                 self.toggle_sound()
             elif k == pygame.K_c:
                 self.open_customize()
+            elif k == pygame.K_u:
+                self.open_upgrades("menu")
             elif k in (pygame.K_4, pygame.K_KP4):
                 self.menu_choose(3)
             elif k in (pygame.K_o,):
@@ -2011,7 +2481,8 @@ class Game:
     SET_ROWS = (("MATCH LENGTH", "How long a game lasts"),
                 ("POWER-UPS", "Pick-ups that appear on the pitch"),
                 ("BOT LEVEL", "How good the computer player is"),
-                ("SOUND", "Sound effects  (N toggles anywhere)"))
+                ("SOUND EFFECTS", "Goals, kicks and whistles  (N toggles anywhere)"),
+                ("BACKGROUND MUSIC", "Original looping soundtrack  (B toggles anywhere)"))
 
     def open_settings(self):
         self.state = "settings"
@@ -2029,9 +2500,13 @@ class Game:
             return "ON" if s["pu"] else "OFF"
         if i == 2:
             return BOT_LEVELS[s["bot"]]["name"]
+        if i == 3:
+            if not self.sound.ok:
+                return "NO AUDIO"
+            return "ON" if self.sound.on else "OFF"
         if not self.sound.ok:
             return "NO AUDIO"
-        return "ON" if self.sound.on else "OFF"
+        return "ON" if self.sound.music_enabled else "OFF"
 
     def settings_change(self, i, d):
         s = self.settings
@@ -2042,8 +2517,10 @@ class Game:
             s["pu"] = not s["pu"]
         elif i == 2:
             s["bot"] = (s["bot"] + d) % len(BOT_LEVELS)
-        else:
+        elif i == 3:
             self.sound.on = not self.sound.on
+        else:
+            self.sound.toggle_music()
         self.sound.play("click")
 
     def events_settings(self, event):
@@ -2155,6 +2632,63 @@ class Game:
             self.lookup_public()
 
     def events_game(self, event):
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.state == "play" and self.handle_touch_pointer("mouse", event.pos, True):
+                return
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self.handle_touch_pointer("mouse", event.pos, False):
+                return
+        elif event.type == pygame.FINGERDOWN:
+            pos = (int(event.x * W), int(event.y * H))
+            if self.state == "play" and self.handle_touch_pointer(("finger", event.finger_id), pos, True):
+                return
+        elif event.type == pygame.FINGERUP:
+            if self.handle_touch_pointer(("finger", event.finger_id), (0, 0), False):
+                return
+
+        if self.state == "replay":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.replay_back_rect.collidepoint(event.pos):
+                    self.state = "finished"
+                elif self.replay_pause_rect.collidepoint(event.pos):
+                    self.replay_playing = not self.replay_playing
+                    self.replay_hold = 0.0
+                elif self.replay_next_rect.collidepoint(event.pos) and self.goal_replays:
+                    self._next_replay_clip(1)
+                return
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                    self.state = "finished"
+                elif event.key == pygame.K_SPACE:
+                    self.replay_playing = not self.replay_playing
+                    self.replay_hold = 0.0
+                elif event.key in (pygame.K_RIGHT, pygame.K_n) and self.goal_replays:
+                    self._next_replay_clip(1)
+                elif event.key in (pygame.K_LEFT, pygame.K_p) and self.goal_replays:
+                    self._next_replay_clip(-1)
+                return
+            return
+
+        if self.state == "finished" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.highlight_video_rect.collidepoint(event.pos):
+                self.start_highlight_replay()
+            elif self.highlight_upgrade_rect.collidepoint(event.pos):
+                self.open_upgrades("finished")
+            elif self.highlight_rematch_rect.collidepoint(event.pos):
+                if self.mode == "host":
+                    self.host_start_match()
+                elif self.mode != "client":
+                    self.start_match(self.mode)
+            elif self.highlight_menu_rect.collidepoint(event.pos):
+                if self.mode == "host":
+                    self.host_to_lobby()
+                elif self.mode == "client":
+                    self.leave_party()
+                else:
+                    self.return_to_menu()
+            return
+
         if event.type == pygame.KEYUP:
             if self.mode == "client":
                 if event.key in (pygame.K_e, pygame.K_p):
@@ -2171,6 +2705,9 @@ class Game:
         k = event.key
         if k == pygame.K_n:
             self.toggle_sound()
+            return
+        if self.state == "finished" and k == pygame.K_u:
+            self.open_upgrades("finished")
             return
 
         if self.mode == "client":
@@ -2189,6 +2726,8 @@ class Game:
             if self.state == "finished":
                 if k == pygame.K_SPACE:
                     self.host_start_match()
+                elif k == pygame.K_h:
+                    self.start_highlight_replay()
                 elif k == pygame.K_m:
                     self.host_to_lobby()
                 return
@@ -2202,6 +2741,8 @@ class Game:
             if self.state == "finished":
                 if k == pygame.K_SPACE:
                     self.start_match(self.mode)
+                elif k == pygame.K_h:
+                    self.start_highlight_replay()
                 elif k in (pygame.K_ESCAPE, pygame.K_m):
                     self.return_to_menu()
                 return
@@ -2373,29 +2914,104 @@ class Game:
             self.p1.clamp_to_field()
             self.p2.clamp_to_field()
 
+
+    def touch_down(self, name):
+        if name in self.touch_held:
+            return
+        self.touch_held.add(name)
+        side, action = name.split("_", 1)
+        player = self.p2 if side == "p2" else self.p1
+        if action == "shoot":
+            if self.mode == "client":
+                self.c_shoot = True
+            else:
+                player.charging = True
+                player.charge = 0.0
+        elif action == "tackle":
+            if self.mode == "client":
+                self.c_tackle += 1
+            else:
+                player.tackle_buffer = 8.0
+
+    def touch_up(self, name):
+        if name not in self.touch_held:
+            return
+        self.touch_held.discard(name)
+        side, action = name.split("_", 1)
+        if action == "shoot":
+            if self.mode == "client":
+                self.c_shoot = False
+            else:
+                self.release_shot(self.p2 if side == "p2" else self.p1)
+
+    def touch_rects(self):
+        def pad(cx, cy, side):
+            return {
+                side + "_up": pygame.Rect(cx - 25, cy - 78, 50, 50),
+                side + "_down": pygame.Rect(cx - 25, cy + 28, 50, 50),
+                side + "_left": pygame.Rect(cx - 78, cy - 25, 50, 50),
+                side + "_right": pygame.Rect(cx + 28, cy - 25, 50, 50),
+            }
+        rects = pad(100, H - 135, "p1")
+        rects.update({
+            "p1_dash": pygame.Rect(235, H - 205, 76, 58),
+            "p1_tackle": pygame.Rect(235, H - 137, 76, 58),
+            "p1_shoot": pygame.Rect(320, H - 171, 94, 94),
+        })
+        if self.mode == "pvp":
+            rects.update(pad(W - 100, H - 135, "p2"))
+            rects.update({
+                "p2_dash": pygame.Rect(W - 311, H - 205, 76, 58),
+                "p2_tackle": pygame.Rect(W - 311, H - 137, 76, 58),
+                "p2_shoot": pygame.Rect(W - 414, H - 171, 94, 94),
+            })
+        return rects
+
+    def handle_touch_pointer(self, pointer_id, pos, down):
+        if down:
+            for name, rect in self.touch_rects().items():
+                if rect.collidepoint(pos):
+                    self.touch_pointer_map[pointer_id] = name
+                    self.touch_down(name)
+                    return True
+        else:
+            name = self.touch_pointer_map.pop(pointer_id, None)
+            if name:
+                self.touch_up(name)
+                return True
+        return False
+
     def combined_input(self, keys):
-        """WASD and the arrow keys both steer (solo / online play)."""
         dx = (int(keys[pygame.K_d]) - int(keys[pygame.K_a])
-              + int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]))
+              + int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
+              + int("p1_right" in self.touch_held) - int("p1_left" in self.touch_held))
         dy = (int(keys[pygame.K_s]) - int(keys[pygame.K_w])
-              + int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]))
-        dash = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH])
+              + int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
+              + int("p1_down" in self.touch_held) - int("p1_up" in self.touch_held))
+        dash = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH]
+                    or "p1_dash" in self.touch_held)
         return clamp(dx, -1, 1), clamp(dy, -1, 1), dash
 
     def read_inputs(self, keys):
         if self.mode == "pvp":
-            in1 = (int(keys[pygame.K_d]) - int(keys[pygame.K_a]),
-                   int(keys[pygame.K_s]) - int(keys[pygame.K_w]),
-                   keys[pygame.K_LSHIFT])
-            in2 = (int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]),
-                   int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]),
-                   keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH])
+            in1 = (clamp(int(keys[pygame.K_d]) - int(keys[pygame.K_a])
+                         + int("p1_right" in self.touch_held) - int("p1_left" in self.touch_held), -1, 1),
+                   clamp(int(keys[pygame.K_s]) - int(keys[pygame.K_w])
+                         + int("p1_down" in self.touch_held) - int("p1_up" in self.touch_held), -1, 1),
+                   bool(keys[pygame.K_LSHIFT] or "p1_dash" in self.touch_held))
+            in2 = (clamp(int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
+                         + int("p2_right" in self.touch_held) - int("p2_left" in self.touch_held), -1, 1),
+                   clamp(int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
+                         + int("p2_down" in self.touch_held) - int("p2_up" in self.touch_held), -1, 1),
+                   bool(keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH] or "p2_dash" in self.touch_held))
             return in1, in2
         return self.combined_input(keys), None
 
     def update(self, dt):
         self.ui_t += dt
         self.fade = max(0.0, self.fade - 7.0 * dt)
+        self.coin_timer = max(0.0, self.coin_timer - dt)
+        self.shop_message_timer = max(0.0, self.shop_message_timer - dt)
         self.shake *= 0.86 ** dt
         if self.shake < 0.2:
             self.shake = 0.0
@@ -2413,12 +3029,17 @@ class Game:
 
         self._update_inner(dt)
         self.audio_cues()
+        music_track = "menu" if self.state in MENU_STATES else "match"
+        self.sound.set_music(music_track)
 
         if (self.net.role == "host" and self.mode == "host" and self.guest_addr
                 and self.state in GAME_STATES):
             self.host_send_snapshot(time.perf_counter())
 
     def _update_inner(self, dt):
+        if self.state == "replay":
+            self.update_highlight_replay(dt)
+            return
         if self.state in MENU_STATES:
             self.update_menu(dt)
             return
@@ -2513,6 +3134,7 @@ class Game:
         self.update_powerups(dt)
 
         self.update_particles(dt)
+        self.record_replay_frame(dt)
 
         if self.ball.x < FIELD_LEFT - 2 and GOAL_TOP <= self.ball.y <= GOAL_BOTTOM:
             self.score_goal(2)
@@ -2529,7 +3151,92 @@ class Game:
                 else:
                     self.finish_match()
 
+    def _replay_player_state(self, p):
+        """Capture only the visual/position properties needed for smooth playback."""
+        return {
+            "x": float(p.x), "y": float(p.y), "vx": float(p.vx), "vy": float(p.vy),
+            "fx": float(p.facing_x), "fy": float(p.facing_y),
+            "anim": float(p.animation_time), "squash": float(p.squash),
+            "kick": float(p.kick_timer), "tackle": float(p.tackle_timer),
+            "flash": float(p.flash_timer), "stamina": float(p.stamina),
+            "exhausted": bool(p.exhausted), "charging": bool(p.charging),
+            "charge": float(p.charge), "boost": float(p.boost_t),
+            "mega": float(p.mega_t), "frozen": float(p.frozen_t),
+        }
+
+    def _capture_replay_frame(self):
+        return {
+            "p1": self._replay_player_state(self.p1),
+            "p2": self._replay_player_state(self.p2),
+            "bx": float(self.ball.x), "by": float(self.ball.y),
+            "br": float(self.ball.rotation),
+            "trail": [(float(x), float(y)) for x, y in self.ball.trail[-10:]],
+            "clock": max(0.0, float(self.clock_frames) / 60.0),
+        }
+
+    def record_replay_frame(self, dt, force=False):
+        """Sample at about 30 fps (game time uses 60-Hz frame units)."""
+        self.replay_capture_accum += max(0.0, dt)
+        if force or self.replay_capture_accum >= 2.0:
+            self.replay_capture_accum %= 2.0
+            self.replay_buffer.append(self._capture_replay_frame())
+            # About five seconds of rolling footage. Keep memory use predictable.
+            if len(self.replay_buffer) > 155:
+                del self.replay_buffer[:-155]
+
+    def start_highlight_replay(self):
+        if not self.goal_replays:
+            self.replay_clip_i = 0
+            self.replay_cursor = 0.0
+            self.replay_playing = False
+            self.replay_hold = 0.0
+            self.state = "replay"
+            self.sound.play("menuok")
+            return
+        self.replay_clip_i = 0
+        self.replay_cursor = 0.0
+        self.replay_playing = True
+        self.replay_hold = 0.0
+        self.replay_actor1 = Player(self.p1.x, self.p1.y, self.p1.color,
+                                    self.p1.dark_color, self.p1.light_color, False)
+        self.replay_actor2 = Player(self.p2.x, self.p2.y, self.p2.color,
+                                    self.p2.dark_color, self.p2.light_color, True)
+        for src, dst in ((self.p1, self.replay_actor1), (self.p2, self.replay_actor2)):
+            dst.color, dst.dark_color, dst.light_color = src.color, src.dark_color, src.light_color
+            dst.accent_color = src.accent_color
+            dst.kit_name = getattr(src, "kit_name", "CUSTOM")
+            dst.shape = getattr(src, "shape", "ROUND")
+        self.state = "replay"
+        self.sound.play("menuok")
+
+    def update_highlight_replay(self, dt):
+        if not self.goal_replays:
+            return
+        if not self.replay_playing:
+            return
+        clip = self.goal_replays[self.replay_clip_i]
+        frames = clip.get("frames", [])
+        if not frames:
+            self._next_replay_clip()
+            return
+        # Cinematic slow motion: about 0.7x normal speed.
+        if self.replay_cursor < len(frames) - 1:
+            self.replay_cursor = min(len(frames) - 1, self.replay_cursor + dt / 2.8)
+        else:
+            self.replay_hold += dt
+            if self.replay_hold >= 25.0:
+                self._next_replay_clip()
+
+    def _next_replay_clip(self, direction=1):
+        if not self.goal_replays:
+            return
+        self.replay_clip_i = (self.replay_clip_i + direction) % len(self.goal_replays)
+        self.replay_cursor = 0.0
+        self.replay_hold = 0.0
+        self.replay_playing = True
+
     def finish_match(self):
+        self.award_match_rewards()
         self.state = "finished"
         self.powerups = []
         for p in (self.p1, self.p2):
@@ -2558,6 +3265,7 @@ class Game:
         self.penalty_wait = 0.0
         self.penalty_finished = False
         self.penalty_winner = None
+        self.penalty_report_delay = 0.0
         self.particles.clear()
         self.shake = 0.0
         self.state = "penalties"
@@ -2572,38 +3280,22 @@ class Game:
         shooter = self.penalty_shooter
         ax, ay = self.penalty_aim_x, self.penalty_aim_y
         if self.penalty_is_bot_turn():
-            # The bot prefers corners, but occasionally disguises a central shot.
-            ax, ay = random.choice([(0, 0), (2, 0), (0, 2), (2, 2), (1, 0), (1, 2)])
+            ax, ay = random.randrange(3), random.randrange(3)
         self.penalty_aim_x, self.penalty_aim_y = ax, ay
+        # The keeper chooses independently, so every attempt feels unpredictable.
         self.penalty_keeper_x, self.penalty_keeper_y = random.randrange(3), random.randrange(3)
-        self.penalty_shot_start = (W // 2, 505)
-        self.penalty_keeper_start = (W // 2, 286)
-        self.penalty_shot_curve = random.uniform(-24, 24)
-        self.penalty_shot_arc = random.uniform(35, 100) if ay == 0 else random.uniform(8, 42)
-        # A keeper needs reaction time. High corners and wide shots are much harder to reach.
-        distance = math.hypot(ax - self.penalty_keeper_x, ay - self.penalty_keeper_y)
-        high_corner = ax != 1 and ay != 1
-        keeper_reach = 0.28 if high_corner else 0.52
-        if distance == 0:
-            scored = random.random() < (0.38 if high_corner else 0.24)
-        elif distance < 1.1:
-            scored = random.random() < (0.78 if high_corner else 0.60)
-        else:
-            scored = random.random() < 0.94
-        # A little keeper skill variation keeps outcomes dramatic rather than deterministic.
-        if random.random() < keeper_reach * 0.08:
-            scored = False
-        if self.mode == "bot" and shooter == 0 and not scored and random.random() < 0.08:
+        exact = (ax == self.penalty_keeper_x and ay == self.penalty_keeper_y)
+        near = (ax == self.penalty_keeper_x or ay == self.penalty_keeper_y)
+        roll = random.random()
+        scored = not (exact or (near and roll < 0.38) or roll < 0.08)
+        # The keeper is a little less perfect in the computer mode, keeping it fun.
+        if self.mode == "bot" and self.penalty_shooter == 0 and exact and random.random() < 0.28:
             scored = True
         self.penalty_last_scored = scored
-        self.penalty_anim = 52.0
-        self.penalty_result = "SHOT!" 
-        self.penalty_flight_start = (W // 2, 505)
-        self.penalty_flight_end = (W // 2 + (ax - 1) * 142, 205 + ay * 48)
-        self.penalty_save_contact = not scored
-        self.penalty_camera_flash = 0.0
+        self.penalty_anim = 36.0
+        self.penalty_result = "GOAL!" if scored else "SAVED!"
         self.sound.play("kick")
-        self.shake = 3.0
+        self.shake = 5.0 if scored else 2.0
 
     def _resolve_penalty(self):
         shooter = self.penalty_shooter
@@ -2635,6 +3327,7 @@ class Game:
             self.penalty_finished = True
         if self.penalty_finished:
             self.state = "penalty_finished"
+            self.penalty_report_delay = 180.0 if not self.penalty_standalone else 0.0
             self.penalty_result = "SHOOTOUT WON!" if self.penalty_winner == 0 else "SHOOTOUT LOST!"
             return
         # Five each; if tied, continue one kick each until the tie breaks.
@@ -2648,6 +3341,14 @@ class Game:
     def update_penalties(self, dt):
         self.update_particles(dt)
         if self.state == "penalty_finished":
+            if not self.penalty_standalone:
+                self.penalty_report_delay -= dt
+                if self.penalty_report_delay <= 0:
+                    # A tie-break ends the match too: show the richer post-match report
+                    # after the shootout result has had a moment on screen.
+                    self.award_match_rewards()
+                    self.state = "finished"
+                    return
             if random.random() < 0.65 * dt:
                 self.spawn_confetti()
             return
@@ -2710,104 +3411,61 @@ class Game:
                     self.take_penalty()
 
     def draw_penalties(self):
-        # Cinematic penalty arena: stadium lights, pitch markings, net depth and a live flight arc.
-        screen.fill((7, 12, 24))
-        for i in range(8):
-            x = 70 + i * 150
-            pygame.draw.polygon(screen, (20, 31, 54), [(x-45, 0), (x+45, 0), (x+100, 125), (x-100, 125)])
-            pygame.draw.circle(screen, (255, 244, 190), (x, 28), 5)
-            pygame.draw.circle(screen, (100, 160, 255), (x, 28), 15, 2)
-        pygame.draw.rect(screen, (15, 55, 49), (0, 125, W, H-125))
-        for y in range(130, H, 42):
-            pygame.draw.line(screen, (18, 67, 57), (0, y), (W, y), 1)
+        self.draw_menu_bg()
         title = "PENALTY SHOOTOUT" if self.state == "penalties" else "SHOOTOUT COMPLETE"
-        draw_text(screen, self.big_font, title, WHITE, (W//2, 48))
-        draw_text(screen, self.small_font, "PICK A CORNER • READ THE KEEPER • HOLD YOUR NERVE", GOLD, (W//2, 91))
-        goal = pygame.Rect(W//2-225, 125, 450, 205)
-        # Goal frame and deep net grid.
-        pygame.draw.rect(screen, (225, 235, 240), goal, border_radius=5)
-        inner = goal.inflate(-12, -12)
-        pygame.draw.rect(screen, (16, 26, 34), inner)
-        for xx in range(inner.left, inner.right, 20):
-            pygame.draw.line(screen, (66, 93, 100), (xx, inner.top), (xx, inner.bottom), 1)
-        for yy in range(inner.top, inner.bottom, 18):
-            pygame.draw.line(screen, (66, 93, 100), (inner.left, yy), (inner.right, yy), 1)
-        lane_centres = [goal.left+70, goal.centerx, goal.right-70]
-        lane_y = [goal.top+40, goal.centery, goal.bottom-38]
+        draw_text(screen, self.big_font, title, WHITE, (W//2, 55))
+        draw_text(screen, self.small_font, "AIM YOUR SHOT • THE KEEPER WILL DIVE RANDOMLY", GOLD, (W//2, 100))
+        # Stylized penalty area and goal.
+        goal = pygame.Rect(W//2-220, 135, 440, 190)
+        pygame.draw.rect(screen, (210, 225, 225), goal, border_radius=8)
+        pygame.draw.rect(screen, (25, 32, 35), goal.inflate(-10, -10), border_radius=5)
+        for xx in range(goal.left+10, goal.right-8, 28):
+            pygame.draw.line(screen, (65, 85, 90), (xx, goal.top+8), (xx, goal.bottom-8), 1)
+        for yy in range(goal.top+8, goal.bottom-8, 22):
+            pygame.draw.line(screen, (65, 85, 90), (goal.left+8, yy), (goal.right-8, yy), 1)
+        # Three-by-three target zones. Selected lane pulses; keeper dive animates to its random lane.
+        lane_centres = [goal.left+75, goal.centerx, goal.right-75]
+        lane_y = [goal.top+45, goal.centery, goal.bottom-42]
         for ix, xx in enumerate(lane_centres):
             for iy, yy in enumerate(lane_y):
-                r = pygame.Rect(xx-31, yy-20, 62, 40)
-                selected = self.state == "penalties" and self.penalty_anim <= 0 and self.penalty_wait <= 0 and ix == self.penalty_aim_x and iy == self.penalty_aim_y
-                pulse = int(4 + 2 * math.sin(self.ui_t * .18))
-                col = GOLD if selected else (65, 91, 99)
-                pygame.draw.rect(screen, col, r.inflate(pulse, pulse) if selected else r, 3 if selected else 1, border_radius=6)
+                r = pygame.Rect(xx-32, yy-22, 64, 44)
+                selected = self.state == "penalties" and self.penalty_anim <= 0 and ix == self.penalty_aim_x and iy == self.penalty_aim_y
+                color = GOLD if selected else (85, 105, 110)
+                pygame.draw.rect(screen, color, r, 3 if selected else 1, border_radius=6)
                 if selected:
-                    draw_text(screen, self.tiny_font, "TARGET", GOLD, (xx, yy), shadow=False)
-        # Goalkeeper: body rotates into a full horizontal dive, arms reach for the ball.
-        dive_progress = clamp((52.0-self.penalty_anim)/24.0, 0.0, 1.0) if self.penalty_anim > 0 else 0.0
-        kx_target, ky_target = lane_centres[self.penalty_keeper_x], lane_y[self.penalty_keeper_y]
-        eased = dive_progress * dive_progress * (3 - 2*dive_progress)
-        keeper_x = lerp(goal.centerx, kx_target, eased)
-        keeper_y = lerp(goal.bottom-27, ky_target, eased)
+                    draw_text(screen, self.tiny_font, "AIM", GOLD, (xx, yy), shadow=False)
+        # Keeper silhouette, diving toward the random lane during the shot animation.
+        kx = lane_centres[self.penalty_keeper_x]
+        ky = lane_y[self.penalty_keeper_y]
+        dive = min(1.0, (36.0-self.penalty_anim)/24.0) if self.penalty_anim > 0 else 0.0
+        keeper_x = lerp(goal.centerx, kx, dive)
+        keeper_y = lerp(goal.bottom-25, ky, dive)
         kcol = (75, 190, 255) if self.penalty_shooter == 1 else (255, 100, 110)
-        dive_dx = (kx_target-goal.centerx) * eased
-        dive_dy = (ky_target-(goal.bottom-27)) * eased
-        angle_len = math.hypot(dive_dx, dive_dy)
-        if angle_len > 0:
-            ux, uy = dive_dx/angle_len, dive_dy/angle_len
-        else:
-            ux, uy = 0.0, -1.0
-        pygame.draw.ellipse(screen, (5, 10, 12), (keeper_x-27, keeper_y+13, 54, 15))
-        pygame.draw.line(screen, kcol, (int(keeper_x-ux*8), int(keeper_y-uy*8)), (int(keeper_x-ux*35-uy*12), int(keeper_y-uy*35+ux*12)), 11)
-        pygame.draw.line(screen, kcol, (int(keeper_x-ux*8), int(keeper_y-uy*8)), (int(keeper_x-ux*35+uy*12), int(keeper_y-uy*35-ux*12)), 11)
-        pygame.draw.line(screen, (25, 55, 90), (int(keeper_x), int(keeper_y)), (int(keeper_x-ux*23), int(keeper_y-uy*23)), 18)
-        pygame.draw.circle(screen, (245, 190, 150), (int(keeper_x-ux*29), int(keeper_y-uy*29)), 12)
-        # Shooter silhouette and spot.
-        pygame.draw.circle(screen, (245, 245, 245, 45), (W//2, 495), 32, 2)
-        pygame.draw.ellipse(screen, (3, 12, 12), (W//2-27, 522, 54, 16))
-        pygame.draw.circle(screen, BLUE_LIGHT if self.penalty_shooter == 0 else RED_LIGHT, (W//2, 490), 15)
-        pygame.draw.line(screen, BLUE if self.penalty_shooter == 0 else RED, (W//2, 505), (W//2, 530), 13)
-        pygame.draw.line(screen, WHITE, (W//2-5, 514), (W//2-20, 531), 6)
-        pygame.draw.line(screen, WHITE, (W//2+5, 514), (W//2+20, 531), 6)
+        pygame.draw.ellipse(screen, (15, 20, 25), (keeper_x-25, keeper_y-12, 50, 24))
+        pygame.draw.circle(screen, kcol, (int(keeper_x), int(keeper_y-22)), 13)
+        pygame.draw.line(screen, kcol, (int(keeper_x-6), int(keeper_y-12)), (int(keeper_x-30), int(keeper_y+2)), 8)
+        pygame.draw.line(screen, kcol, (int(keeper_x+6), int(keeper_y-12)), (int(keeper_x+30), int(keeper_y+2)), 8)
         if self.penalty_anim > 0:
-            raw = clamp(1.0-self.penalty_anim/52.0, 0.0, 1.0)
-            prog = raw*raw*(3-2*raw)
-            bx0, by0 = self.penalty_flight_start
-            bx1, by1 = self.penalty_flight_end
-            bx = lerp(bx0, bx1, prog) + math.sin(prog*math.pi)*self.penalty_shot_curve
-            by = lerp(by0, by1, prog) - math.sin(prog*math.pi)*self.penalty_shot_arc
-            # A dotted, fading trail makes the ball feel fast and gives it a visible arc.
-            for j in range(1, 7):
-                t = max(0, prog-j*.035)
-                tx = lerp(bx0, bx1, t) + math.sin(t*math.pi)*self.penalty_shot_curve
-                ty = lerp(by0, by1, t) - math.sin(t*math.pi)*self.penalty_shot_arc
-                pygame.draw.circle(screen, (255, 225, 125), (int(tx), int(ty)), max(1, 5-j//2))
-            draw_ball(screen, bx, by, max(6, int(13-4*prog)), prog*9, 505)
-            if prog > .72 and self.penalty_save_contact:
-                for _ in range(2):
-                    pygame.draw.circle(screen, GOLD, (int(bx), int(by)), int(8+(prog-.72)*65), 2)
+            bx = lane_centres[self.penalty_aim_x]
+            by = lane_y[self.penalty_aim_y]
+            prog = 1.0-self.penalty_anim/36.0
+            ball_x = lerp(W//2, bx, prog)
+            ball_y = lerp(505, by, prog)
+            draw_ball(screen, ball_x, ball_y, max(5, int(13-6*prog)), prog*5, 505)
         else:
-            draw_ball(screen, W//2, 505, 13, self.ui_t*.08)
-        # Score panel with individual kick indicators.
-        panel = pygame.Rect(W//2-290, 555, 580, 64)
-        pygame.draw.rect(screen, (12, 20, 29), panel, border_radius=15)
-        pygame.draw.rect(screen, (85, 115, 125), panel, 2, border_radius=15)
-        draw_text(screen, self.menu_font, f"BLUE   {self.penalty_scores[0]}  -  {self.penalty_scores[1]}   RED", WHITE, (W//2, 574))
-        for team in range(2):
-            for n in range(5):
-                cx = W//2 + (n-2)*22 + (-205 if team == 0 else 205)
-                cy = 600
-                filled = n < self.penalty_taken[team]
-                scored = filled and (n < self.penalty_scores[team]) # simple visual tally
-                color = (85, 220, 135) if scored else ((245, 85, 95) if filled else (75, 90, 100))
-                pygame.draw.circle(screen, color, (cx, cy), 6)
-        status_color = GOLD if self.penalty_last_scored else WHITE
-        draw_text(screen, self.menu_font, self.penalty_result, status_color, (W//2, 646))
+            draw_ball(screen, W//2, 505, 13, self.ui_t*0.08)
+        # Scoreboard and attempt markers.
+        panel = pygame.Rect(W//2-280, 535, 560, 65)
+        pygame.draw.rect(screen, UI, panel, border_radius=14)
+        pygame.draw.rect(screen, (85, 100, 105), panel, 2, border_radius=14)
+        draw_text(screen, self.menu_font, f"BLUE  {self.penalty_scores[0]}  -  {self.penalty_scores[1]}  RED", WHITE, (W//2, 553))
+        draw_text(screen, self.tiny_font, f"KICKS  {self.penalty_taken[0]} / 5  •  {self.penalty_taken[1]} / 5", (195, 210, 210), (W//2, 582), shadow=False)
+        draw_text(screen, self.menu_font, self.penalty_result, GOLD if self.penalty_last_scored else WHITE, (W//2, 625))
         if self.state == "penalty_finished":
             winner = "BLUE PLAYER WINS!" if self.penalty_winner == 0 else ("RED PLAYER WINS!" if self.penalty_winner == 1 else "SHOOTOUT COMPLETE!")
             if self.mode == "bot" and not self.penalty_standalone:
                 winner = "YOU WIN!" if self.penalty_winner == 0 else "BOT WINS!"
-            draw_text(screen, self.font, winner, GOLD, (W//2, 680))
+            draw_text(screen, self.font, winner, GOLD, (W//2, 665))
             pygame.draw.rect(screen, UI, (W//2-390, H-110, 240, 54), border_radius=12)
             pygame.draw.rect(screen, (100, 115, 120), (W//2-390, H-110, 240, 54), 2, border_radius=12)
             draw_text(screen, self.small_font, "MAIN MENU  [ESC]", WHITE, (W//2-270, H-83), shadow=False)
@@ -2844,6 +3502,8 @@ class Game:
 
     def goal_fx(self, bx, by, player_number):
         """Banner text + burst of particles (shared by host, solo play and the guest)."""
+        self.goal_history.append({"side": int(player_number),
+                                  "time": max(0.0, float(self.clock_frames) / 60.0)})
         color = BLUE if player_number == 1 else RED
         self.goal_color = color
         self.goal_message = f"{self.side_name(player_number)} SCORES!"
@@ -2859,11 +3519,76 @@ class Game:
                 color if random.random() < 0.65 else GOLD,
                 random.randint(2, 6), random.randint(30, 60), 0.06))
 
+    def award_goal_coins(self, player_number):
+        """Grant career coins when the main player scores a genuine shot goal."""
+        if self.mode not in ("bot", "pvp") or player_number != 1:
+            return
+        if self.ball.last_shot_side != 1:
+            return  # don't award coins for an own goal or an opponent's shot
+        origin = self.ball.last_shot_origin
+        from_own_half = bool(origin and origin[0] < W / 2)
+        amount = 10 if from_own_half else 5
+        self.profile["coins"] += amount
+        self.profile["total_goals"] += 1
+        self.coin_message = f"+{amount} COINS  ·  " + ("LONG-RANGE GOAL!" if from_own_half else "GOAL!")
+        self.coin_timer = 130.0
+        self.save_profile()
+        self.sound.play("pickup", 0.85)
+
+    def award_match_rewards(self):
+        """Give a one-time career reward for a local match result."""
+        if self.match_rewarded:
+            return
+        self.match_rewarded = True
+        if self.mode not in ("bot", "pvp"):
+            return
+        if self.penalty_finished and not self.penalty_standalone and self.penalty_winner in (0, 1):
+            winner = self.penalty_winner + 1
+        elif self.blue_score > self.red_score:
+            winner = 1
+        elif self.red_score > self.blue_score:
+            winner = 2
+        else:
+            winner = 0
+        self.profile["matches"] += 1
+        if winner == 1:
+            self.profile["coins"] += 30
+            self.profile["wins"] += 1
+            self.coin_message = "+30 COINS  ·  MATCH WIN BONUS!"
+            self.last_match_reward = "REWARD: +30 COINS FOR THE WIN!"
+            self.coin_timer = 180.0
+        elif winner == 0:
+            self.profile["coins"] += 10
+            self.coin_message = "+10 COINS  ·  DRAW BONUS"
+            self.last_match_reward = "REWARD: +10 COINS FOR THE DRAW"
+            self.coin_timer = 150.0
+        else:
+            self.last_match_reward = "NO WIN BONUS THIS MATCH — GOALS STILL EARN COINS"
+        self.save_profile()
+
     def score_goal(self, player_number):
         if player_number == 1:
             self.blue_score += 1
         else:
             self.red_score += 1
+
+        self.award_goal_coins(player_number)
+        scorer = self.p1 if player_number == 1 else self.p2
+        scorer.celebration_timer = 150.0
+        scorer.flash_timer = max(scorer.flash_timer, 24.0)
+
+        # Preserve the action leading into the goal. Clips are played back later
+        # as short slow-motion replays on the full-time highlight screen.
+        self.record_replay_frame(0.0, force=True)
+        clip_frames = list(self.replay_buffer[-105:])
+        if clip_frames:
+            self.goal_replays.append({
+                "side": int(player_number),
+                "time": max(0.0, float(self.clock_frames) / 60.0),
+                "frames": clip_frames,
+            })
+            if len(self.goal_replays) > 8:
+                self.goal_replays.pop(0)
 
         self.state = "goal"
         self.goal_timer = 150.0
@@ -2980,9 +3705,10 @@ class Game:
         draw_text(screen, self.small_font, "LOCAL SOCCER  -  CHOOSE YOUR GAME MODE",
                   (220, 235, 220), (W // 2, 160))
 
-        options = [("1 V 1", "Play against another player"),
+        options = [("1 V 1", "Play against another player on this device"),
                    ("1 V BOT", "Play against the computer"),
-                   ("ONLINE PARTY", "Create or join a party over the network"),
+                   (("ONLINE (DESKTOP ONLY)" if WEB_BUILD else "ONLINE PARTY"),
+                    ("Not available in the browser version" if WEB_BUILD else "Create or join a party over the network")),
                    ("PENALTY SHOOTOUTS", "Pick your shot. Can you beat the keeper?")]
         for i, (name, description) in enumerate(options):
             self.draw_button(self.menu_rects[i], self.menu_selection == i, name, description)
@@ -2993,6 +3719,13 @@ class Game:
         pygame.draw.rect(screen, GOLD if chov else (90, 100, 105), cr, 3, border_radius=14)
         draw_text(screen, self.small_font, "CUSTOMIZE  (C)", GOLD if chov else WHITE, cr.center, shadow=False)
 
+        ur = self.upgrade_rect
+        uhov = ur.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(screen, UI_LIGHT if uhov else UI, ur, border_radius=14)
+        pygame.draw.rect(screen, GOLD if uhov else (90, 100, 105), ur, 3 if uhov else 1, border_radius=14)
+        draw_text(screen, self.small_font, f"UPGRADES  (U)  ·  {self.profile['coins']} C",
+                  GOLD if uhov else WHITE, ur.center, shadow=False)
+
         sr = self.settings_rect
         hov = sr.collidepoint(pygame.mouse.get_pos())
         pygame.draw.rect(screen, UI_LIGHT if hov else UI, sr, border_radius=14)
@@ -3000,9 +3733,12 @@ class Game:
         draw_text(screen, self.small_font, "SETTINGS  (O)", GOLD if hov else WHITE, sr.center,
                   shadow=False)
 
+        music_label = "MUSIC ON [B]" if self.sound.music_enabled else "MUSIC OFF [B]"
         draw_text(screen, self.small_font,
-                  "UP / DOWN SELECT   ENTER / CLICK PLAY   1-4 QUICK SELECT   C CUSTOMIZE   O SETTINGS",
+                  f"UP / DOWN SELECT   ENTER PLAY   C CUSTOMIZE   U UPGRADES   O SETTINGS   {music_label}",
                   WHITE, (W // 2, H - 24))
+        if WEB_BUILD and self.net_msg:
+            draw_text(screen, self.small_font, self.net_msg, GOLD, (W // 2, H - 54))
 
     def events_customize(self, event):
         if event.type == pygame.KEYDOWN:
@@ -3016,10 +3752,19 @@ class Game:
                 self.cycle_kit(0, 1)
             elif k == pygame.K_q:
                 self.cycle_kit(1, -1)
-            elif k == pygame.K_e:
+            elif k in (pygame.K_e, pygame.K_TAB):
                 self.cycle_kit(1, 1)
-            elif k == pygame.K_TAB:
-                self.cycle_kit(1, 1)
+            elif k in (pygame.K_w, pygame.K_UP):
+                self.cycle_shape(0, -1)
+            elif k in (pygame.K_s, pygame.K_DOWN):
+                self.cycle_shape(0, 1)
+            elif k == pygame.K_z:
+                self.cycle_shape(1, -1)
+            elif k == pygame.K_x:
+                self.cycle_shape(1, 1)
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.state = "menu"
+                self.sound.play("click")
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for side, rects in enumerate(self.kit_card_rects()):
                 for idx, rect in enumerate(rects):
@@ -3029,52 +3774,87 @@ class Game:
                             self.apply_kit(player, idx)
                         self.sound.play("menuok")
                         return
-            if pygame.Rect(W // 2 - 110, H - 82, 220, 52).collidepoint(event.pos):
+            for side, rects in enumerate(self.shape_card_rects()):
+                for idx, rect in enumerate(rects):
+                    if rect.collidepoint(event.pos):
+                        self.shape_indices[side] = idx
+                        for player in ((self.menu_p1, self.p1) if side == 0 else (self.menu_p2, self.p2)):
+                            self.apply_shape(player, idx)
+                        self.sound.play("menuok")
+                        return
+            if pygame.Rect(W // 2 - 110, 590, 220, 48).collidepoint(event.pos):
                 self.state = "menu"
                 self.sound.play("click")
 
     def kit_card_rects(self):
-        return [[pygame.Rect(100 + i * 125, 330, 105, 105) for i in range(len(KITS))],
-                [pygame.Rect(100 + i * 125, 500, 105, 105) for i in range(len(KITS))]]
+        # Twelve compact colour swatches per player, all visible without scrolling.
+        return [[pygame.Rect(110 + i * 82, 245 + side * 80, 72, 68)
+                 for i in range(len(KITS))] for side in range(2)]
+
+    def shape_card_rects(self):
+        return [[pygame.Rect(270 + i * 116, 400 + side * 42, 108, 34)
+                 for i in range(len(self.shape_options))] for side in range(2)]
 
     def draw_customize(self):
         self.draw_menu_bg()
-        draw_text(screen, self.big_font, "KIT LAB", WHITE, (W // 2, 65))
-        draw_text(screen, self.small_font, "BUILD YOUR LOOK. BRING THE ENERGY.", GOLD, (W // 2, 112))
-        # Animated showcase players preview the selected uniforms.
+        draw_text(screen, self.big_font, "PLAYER LAB", WHITE, (W // 2, 38))
+        draw_text(screen, self.small_font, "YOUR LOOK. YOUR COLOURS. YOUR STYLE.", GOLD, (W // 2, 76))
+
+        # Animated player previews are rendered with the actual selected shape and kit.
         t = self.menu_t
-        for side, player, x in ((0, self.menu_p1, W // 2 - 190), (1, self.menu_p2, W // 2 + 190)):
+        for side, player, x in ((0, self.menu_p1, W // 2 - 285), (1, self.menu_p2, W // 2 + 285)):
             player.x = x
-            player.y = 218 + math.sin(t * 0.08 + side) * 5
+            player.y = 132 + math.sin(t * 0.08 + side) * 4
             player.facing_x = 1 if side == 0 else -1
             player.facing_y = math.sin(t * 0.025 + side) * 0.12
             player.animation_time += 0.7
             player.draw(screen)
             title = "PLAYER 1 / BLUE SIDE" if side == 0 else "PLAYER 2 / RED SIDE"
-            controls = "A / D OR CLICK A KIT" if side == 0 else "Q / E OR CLICK A KIT"
-            draw_text(screen, self.menu_font, title, player.light_color, (x, 275))
-            draw_text(screen, self.tiny_font, controls, WHITE, (x, 301))
-            draw_text(screen, self.small_font, KITS[self.kit_indices[side]][0], GOLD, (x, 325))
+            draw_text(screen, self.small_font, title, player.light_color, (x, 178))
+            draw_text(screen, self.tiny_font,
+                      f"{KITS[self.kit_indices[side]][0]}  |  {self.shape_options[self.shape_indices[side]]}",
+                      GOLD, (x, 199))
 
+        # Colour palettes.
         for side, rects in enumerate(self.kit_card_rects()):
+            draw_text(screen, self.tiny_font,
+                      f"PLAYER {side + 1} COLOURS  -  " + ("A / D" if side == 0 else "Q / E"),
+                      WHITE, (W // 2, rects[0].top - 9), shadow=False)
             for idx, rect in enumerate(rects):
                 name, main, dark, light, accent = KITS[idx]
                 selected = self.kit_indices[side] == idx
-                r = rect.copy()
-                pulse = int(2 + math.sin(t * 0.12 + idx) * 1.5) if selected else 0
-                r.inflate_ip(pulse * 2, pulse * 2)
-                pygame.draw.rect(screen, (27, 34, 39), r, border_radius=12)
-                pygame.draw.rect(screen, GOLD if selected else (85, 100, 105), r, 3 if selected else 1, border_radius=12)
-                pygame.draw.circle(screen, dark, (r.centerx, r.centery - 8), 25)
-                pygame.draw.circle(screen, main, (r.centerx, r.centery - 10), 22)
-                pygame.draw.arc(screen, accent, (r.centerx - 19, r.centery - 29, 38, 38), 0.3, 2.8, 4)
-                pygame.draw.line(screen, light, (r.centerx - 13, r.centery - 10), (r.centerx + 13, r.centery - 10), 5)
-                draw_text(screen, self.tiny_font, name, WHITE if selected else (185, 195, 195), (r.centerx, r.bottom - 13), shadow=False)
-        pygame.draw.rect(screen, UI, (W // 2 - 110, H - 82, 220, 52), border_radius=15)
-        pygame.draw.rect(screen, GOLD, (W // 2 - 110, H - 82, 220, 52), 2, border_radius=15)
-        draw_text(screen, self.menu_font, "DONE  [ESC]", GOLD, (W // 2, H - 56), shadow=False)
-        draw_text(screen, self.tiny_font, "Kits stay equipped for local matches. Each kit has its own trim and boost glow.",
-                  (215, 225, 220), (W // 2, H - 15))
+                pygame.draw.rect(screen, (24, 31, 38), rect, border_radius=10)
+                pygame.draw.rect(screen, GOLD if selected else (75, 89, 98), rect,
+                                 3 if selected else 1, border_radius=10)
+                pygame.draw.circle(screen, dark, (rect.centerx, rect.centery - 7), 19)
+                pygame.draw.circle(screen, main, (rect.centerx, rect.centery - 9), 16)
+                pygame.draw.arc(screen, accent,
+                                (rect.centerx - 14, rect.centery - 23, 28, 28), 0.35, 2.8, 3)
+                pygame.draw.line(screen, light,
+                                 (rect.centerx - 10, rect.centery - 8),
+                                 (rect.centerx + 10, rect.centery - 8), 3)
+                draw_text(screen, self.tiny_font, name[:9],
+                          WHITE if selected else (180, 192, 198),
+                          (rect.centerx, rect.bottom - 9), shadow=False)
+
+        # Shape picker for each player.
+        for side, rects in enumerate(self.shape_card_rects()):
+            draw_text(screen, self.tiny_font, f"P{side + 1} SHAPE",
+                      GOLD, (118, rects[0].centery), shadow=False)
+            for idx, rect in enumerate(rects):
+                selected = self.shape_indices[side] == idx
+                pygame.draw.rect(screen, (25, 33, 40), rect, border_radius=9)
+                pygame.draw.rect(screen, GOLD if selected else (75, 89, 98), rect,
+                                 2 if selected else 1, border_radius=9)
+                draw_text(screen, self.tiny_font, self.shape_options[idx],
+                          WHITE if selected else (175, 187, 194), rect.center, shadow=False)
+
+        pygame.draw.rect(screen, UI, (W // 2 - 110, 590, 220, 48), border_radius=14)
+        pygame.draw.rect(screen, GOLD, (W // 2 - 110, 590, 220, 48), 2, border_radius=14)
+        draw_text(screen, self.menu_font, "DONE  [ENTER]", GOLD, (W // 2, 614), shadow=False)
+        draw_text(screen, self.tiny_font,
+                  "P1 shape: W / S   |   P2 shape: Z / X   |   Click any colour or shape to equip it",
+                  (215, 225, 220), (W // 2, 670))
 
     def draw_settings(self):
         self.draw_menu_bg()
@@ -3438,6 +4218,9 @@ class Game:
         scale = 0.6 + 0.4 * slide + 0.05 * math.sin(prog * 14)
         self.draw_big_center("GOAL!", WHITE, scale, band_y + 60, self.big_font)
         draw_text(screen, self.font, self.goal_message, GOLD, (W // 2, band_y + 150))
+        if self.coin_timer > 0 and self.coin_message:
+            draw_text(screen, self.font, self.coin_message, GOLD,
+                      (W // 2, band_y + 190), shadow=True)
 
     def draw_overlay_text(self, title, color, lines):
         overlay = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -3447,6 +4230,368 @@ class Game:
         for i, line in enumerate(lines):
             draw_text(screen, self.font if i == 0 else self.small_font, line, WHITE,
                       (W // 2, H // 2 + 10 + i * 42))
+
+    def award_winner(self, metric, goals=None):
+        """Choose a side for a post-match award; return None for a draw."""
+        vals = []
+        for side in range(2):
+            if metric == "mvp":
+                goals_n = (goals or [0, 0])[side]
+                value = goals_n * 4.0 + self.stats["shots"][side] * 0.8 + \
+                    self.stats["steals"][side] * 1.15 + self.stats["pu"][side] * 0.7 + \
+                    self.stats["poss"][side] / 240.0
+            else:
+                value = self.stats[metric][side]
+            vals.append(float(value))
+        if abs(vals[0] - vals[1]) < 0.01:
+            return None, vals
+        return (0 if vals[0] > vals[1] else 1), vals
+
+    def draw_match_highlights(self):
+        """A dedicated full-time report with awards, stats, and a goal timeline."""
+        screen.fill((8, 14, 23))
+        t = self.ui_t
+        # Ambient stadium beams and a subtle pitch-like grid.
+        for i in range(9):
+            x = int(i * W / 8 + math.sin(t * 0.01 + i) * 14)
+            pygame.draw.line(screen, (15, 29, 39), (x, 0), (x - 110, H), 2)
+        pygame.draw.ellipse(screen, (12, 27, 35), (80, -145, W - 160, 430), 2)
+        pygame.draw.ellipse(screen, (12, 27, 35), (175, -100, W - 350, 340), 2)
+
+        draw_text(screen, self.tiny_font, "HYPER SOCCER  /  POST-MATCH REPORT",
+                  (145, 175, 185), (W // 2, 22), shadow=False)
+        draw_text(screen, self.big_font, "MATCH HIGHLIGHTS", WHITE, (W // 2, 56))
+
+        score_panel = pygame.Rect(58, 86, W - 116, 108)
+        pygame.draw.rect(screen, (19, 29, 39), score_panel, border_radius=18)
+        pygame.draw.rect(screen, (56, 72, 82), score_panel, 2, border_radius=18)
+        left_col = self.p1.color
+        right_col = self.p2.color
+        draw_text(screen, self.font, self.side_name(1), left_col,
+                  (score_panel.left + 170, score_panel.centery - 10))
+        draw_text(screen, self.font, self.side_name(2), right_col,
+                  (score_panel.right - 170, score_panel.centery - 10))
+        draw_text(screen, self.big_font, f"{self.blue_score}  -  {self.red_score}",
+                  GOLD if self.blue_score == self.red_score else WHITE,
+                  (score_panel.centerx, score_panel.centery - 7))
+        shootout_decided = (not self.penalty_standalone and self.penalty_finished
+                            and self.penalty_winner in (0, 1))
+        if shootout_decided:
+            winner_side = self.penalty_winner + 1
+            result = f"{self.side_name(winner_side)} WIN ON PENALTIES!"
+            result_col = left_col if winner_side == 1 else right_col
+        elif self.blue_score > self.red_score:
+            result = f"{self.side_name(1)} TAKE THE WIN!"
+            result_col = left_col
+        elif self.red_score > self.blue_score:
+            result = f"{self.side_name(2)} TAKE THE WIN!"
+            result_col = right_col
+        else:
+            result, result_col = "IT'S A DRAW!", GOLD
+        if shootout_decided:
+            result += f"  ({self.penalty_scores[0]} - {self.penalty_scores[1]} pens)"
+        draw_text(screen, self.small_font, result, result_col,
+                  (score_panel.centerx, score_panel.bottom - 15), shadow=False)
+
+        goals = [0, 0]
+        for g in self.goal_history:
+            if int(g.get("side", 1)) in (1, 2):
+                goals[int(g["side"]) - 1] += 1
+        awards = [
+            ("MATCH MVP", "mvp", goals, "impact score"),
+            ("SHOT CREATOR", "shots", None, "shots taken"),
+            ("TACKLE ACE", "steals", None, "clean steals"),
+            ("POWER-UP PRO", "pu", None, "power-ups"),
+        ]
+        card_y, card_h, card_w, card_gap = 211, 111, 250, 23
+        total_w = card_w * 4 + card_gap * 3
+        start_x = (W - total_w) // 2
+        for i, (label, metric, goalarg, sublabel) in enumerate(awards):
+            x = start_x + i * (card_w + card_gap)
+            rect = pygame.Rect(x, card_y, card_w, card_h)
+            pygame.draw.rect(screen, (19, 29, 39), rect, border_radius=14)
+            pygame.draw.rect(screen, (57, 74, 84), rect, 1, border_radius=14)
+            winner, vals = self.award_winner(metric, goalarg)
+            draw_text(screen, self.tiny_font, label, (165, 185, 193),
+                      (rect.centerx, rect.y + 18), shadow=False)
+            if winner is None:
+                name, col, val = "SHARED", GOLD, "TIED"
+            else:
+                name = self.side_name(winner + 1)
+                col = left_col if winner == 0 else right_col
+                val = str(int(round(vals[winner])))
+            draw_text(screen, self.menu_font, name, col, (rect.centerx, rect.y + 52))
+            draw_text(screen, self.tiny_font, f"{val}  {sublabel}", WHITE,
+                      (rect.centerx, rect.bottom - 16), shadow=False)
+
+        if self.last_match_reward:
+            draw_text(screen, self.tiny_font, self.last_match_reward, GOLD,
+                      (W // 2, 333), shadow=False)
+
+        timeline = pygame.Rect(58, 342, W - 116, 214)
+        pygame.draw.rect(screen, (16, 26, 35), timeline, border_radius=16)
+        pygame.draw.rect(screen, (51, 68, 78), timeline, 1, border_radius=16)
+        draw_text(screen, self.small_font, "GOAL TIMELINE",
+                  GOLD, (timeline.left + 22, timeline.top + 22), anchor="midleft", shadow=False)
+        if not self.goal_history:
+            draw_text(screen, self.small_font,
+                      "No goals this match — the defenders owned the pitch.",
+                      (178, 192, 198), (timeline.centerx, timeline.centery + 8), shadow=False)
+        else:
+            shown = self.goal_history[-6:]
+            if len(self.goal_history) > len(shown):
+                draw_text(screen, self.tiny_font,
+                          f"+{len(self.goal_history) - len(shown)} earlier goals",
+                          (145, 160, 168), (timeline.right - 22, timeline.top + 22),
+                          anchor="midright", shadow=False)
+            for i, g in enumerate(shown):
+                col_idx = i % 2
+                row = i // 2
+                x = timeline.left + 22 + col_idx * 530
+                y = timeline.top + 55 + row * 43
+                side = int(g.get("side", 1))
+                col = left_col if side == 1 else right_col
+                secs = max(0, int(float(g.get("time", 0))))
+                stamp = f"{secs // 60:02d}:{secs % 60:02d}"
+                chip = pygame.Rect(x, y - 14, 500, 34)
+                pygame.draw.rect(screen, (27, 39, 48), chip, border_radius=9)
+                pygame.draw.circle(screen, col, (chip.x + 15, chip.centery), 5)
+                draw_text(screen, self.tiny_font, stamp,
+                          (160, 179, 188), (chip.x + 31, chip.centery), anchor="midleft", shadow=False)
+                draw_text(screen, self.small_font, f"{self.side_name(side)}  GOAL",
+                          col, (chip.x + 92, chip.centery), anchor="midleft", shadow=False)
+
+        # A small stat strip keeps the report useful without crowding the goal story.
+        p1_poss, p2_poss = self.stats["poss"]
+        poss_total = p1_poss + p2_poss
+        p1_pct = int(round(100 * p1_poss / poss_total)) if poss_total else 50
+        p2_pct = 100 - p1_pct
+        summary = (f"SHOTS  {int(self.stats['shots'][0])} - {int(self.stats['shots'][1])}"
+                   f"     |     POSSESSION  {p1_pct}% - {p2_pct}%"
+                   f"     |     STEALS  {int(self.stats['steals'][0])} - {int(self.stats['steals'][1])}")
+        draw_text(screen, self.tiny_font, summary, (190, 205, 210), (W // 2, 576), shadow=False)
+        draw_text(screen, self.small_font,
+                  f"CAREER COINS  {self.profile['coins']}   ·   GOALS  {self.profile['total_goals']}   ·   WINS  {self.profile['wins']}",
+                  GOLD, (W // 2, 606), shadow=False)
+
+        # The video button opens actual slow-motion replay clips captured during play.
+        video_label = "WATCH VIDEO [H]" if self.goal_replays else "VIDEO REPLAY [H]"
+        rematch_label = "WAIT FOR HOST" if self.mode == "client" else "REMATCH  [SPACE]"
+        for rect, label in ((self.highlight_video_rect, video_label),
+                            (self.highlight_rematch_rect, rematch_label),
+                            (self.highlight_menu_rect,
+                             "LOBBY  [M]" if self.mode == "host" else
+                             ("LEAVE  [ESC]" if self.mode == "client" else "MAIN MENU  [ESC]")),
+                            (self.highlight_upgrade_rect, "UPGRADES  [U]")) :
+            hover = rect.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(screen, (34, 47, 57) if hover else (20, 31, 41), rect,
+                             border_radius=12)
+            pygame.draw.rect(screen, GOLD if hover else (70, 91, 100), rect,
+                             2 if hover else 1, border_radius=12)
+            draw_text(screen, self.small_font, label, GOLD if hover else WHITE,
+                      rect.center, shadow=False)
+
+        self.fx_layer.fill((0, 0, 0, 0))
+        for particle in self.particles:
+            particle.draw(self.fx_layer)
+        screen.blit(self.fx_layer, (0, 0))
+
+    def draw_upgrade_shop(self):
+        """Career screen where earned coins can be spent on gameplay upgrades."""
+        screen.fill((7, 13, 22))
+        t = self.ui_t
+        for i in range(10):
+            x = int(i * W / 9 + math.sin(t * 0.008 + i) * 18)
+            pygame.draw.line(screen, (17, 33, 44), (x, 0), (x - 90, H), 2)
+        draw_text(screen, self.tiny_font, "HYPER SOCCER  /  CAREER MODE",
+                  (150, 177, 190), (W // 2, 28), shadow=False)
+        draw_text(screen, self.big_font, "PLAYER UPGRADES", WHITE, (W // 2, 70))
+        draw_text(screen, self.font, f"COINS: {self.profile['coins']}",
+                  GOLD, (W // 2, 122), shadow=False)
+        draw_text(screen, self.tiny_font,
+                  f"CAREER  ·  {self.profile['total_goals']} GOALS  ·  {self.profile['wins']} WINS  ·  MATCHES {self.profile['matches']}",
+                  (185, 202, 208), (W // 2, 153), shadow=False)
+
+        accent_cols = ((95, 173, 255), (111, 236, 177), (255, 147, 113))
+        for i, key in enumerate(self.upgrade_keys):
+            rect = self.upgrade_rects[i]
+            col = accent_cols[i]
+            hover = rect.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(screen, (22, 34, 45) if not hover else (31, 48, 61), rect,
+                             border_radius=18)
+            pygame.draw.rect(screen, col if hover else (62, 82, 94), rect,
+                             2 if hover else 1, border_radius=18)
+            level = int(self.profile['upgrades'][key])
+            draw_text(screen, self.small_font, self.upgrade_titles[i], col,
+                      (rect.centerx, rect.top + 32), shadow=False)
+            draw_text(screen, self.tiny_font, self.upgrade_descriptions[i],
+                      (207, 218, 224), (rect.centerx, rect.top + 70), shadow=False)
+            draw_text(screen, self.big_font, f"LV {level} / 5", WHITE,
+                      (rect.centerx, rect.top + 126))
+            bar = pygame.Rect(rect.x + 35, rect.top + 157, rect.w - 70, 12)
+            pygame.draw.rect(screen, (42, 54, 63), bar, border_radius=6)
+            if level:
+                fill = pygame.Rect(bar.x, bar.y, int(bar.w * level / 5), bar.h)
+                pygame.draw.rect(screen, col, fill, border_radius=6)
+            for pip in range(5):
+                px = bar.x + int((pip + 0.5) * bar.w / 5)
+                pygame.draw.circle(screen, WHITE if pip < level else (84, 97, 106),
+                                   (px, bar.centery), 3)
+            if level >= 5:
+                buy_label, buy_col = "MAX LEVEL", col
+            else:
+                cost = self.upgrade_cost(key)
+                buy_label = f"UPGRADE  ·  {cost} COINS"
+                buy_col = GOLD if self.profile['coins'] >= cost else (169, 177, 181)
+            buy = pygame.Rect(rect.x + 28, rect.bottom - 74, rect.w - 56, 48)
+            pygame.draw.rect(screen, (39, 51, 60), buy, border_radius=12)
+            pygame.draw.rect(screen, col if hover else (83, 103, 113), buy, 2, border_radius=12)
+            draw_text(screen, self.small_font, buy_label, buy_col, buy.center, shadow=False)
+            draw_text(screen, self.tiny_font, f"PRESS {i + 1} OR CLICK CARD",
+                      (144, 163, 172), (rect.centerx, rect.bottom - 12), shadow=False)
+
+        self.upgrade_back_rect = pygame.Rect(W // 2 - 105, 548, 210, 48)
+        back_hover = self.upgrade_back_rect.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(screen, (34, 46, 56) if back_hover else (19, 29, 39),
+                         self.upgrade_back_rect, border_radius=13)
+        pygame.draw.rect(screen, GOLD if back_hover else (72, 92, 103),
+                         self.upgrade_back_rect, 2 if back_hover else 1, border_radius=13)
+        draw_text(screen, self.small_font, "BACK  [ESC]", GOLD if back_hover else WHITE,
+                  self.upgrade_back_rect.center, shadow=False)
+        if self.shop_message_timer > 0 and self.shop_message:
+            draw_text(screen, self.small_font, self.shop_message, GOLD,
+                      (W // 2, 624), shadow=False)
+        else:
+            draw_text(screen, self.tiny_font,
+                      "Earn 5 coins for a goal from the opponent's half · 10 from your own half · +30 for a win",
+                      (183, 199, 208), (W // 2, 624), shadow=False)
+        draw_text(screen, self.tiny_font,
+                  "UPGRADES AFFECT YOUR BLUE PLAYER IN LOCAL MATCHES. CAREER SAVE IS STORED BESIDE THE GAME FILE.",
+                  (137, 154, 164), (W // 2, H - 20), shadow=False)
+        self.fx_layer.fill((0, 0, 0, 0))
+        for particle in self.particles:
+            particle.draw(self.fx_layer)
+        screen.blit(self.fx_layer, (0, 0))
+
+    def draw_replay_viewer(self):
+        """Render a cinematic, slow-motion goal replay with a video timeline."""
+        screen.fill((3, 8, 14))
+        if not self.goal_replays:
+            for i in range(8):
+                x = i * W // 7
+                pygame.draw.line(screen, (13, 30, 42), (x, 0), (x - 150, H), 2)
+            draw_text(screen, self.big_font, "NO GOAL CLIPS YET", WHITE, (W // 2, H // 2 - 25))
+            draw_text(screen, self.small_font,
+                      "Goal replays are captured automatically during a match.",
+                      (166, 190, 201), (W // 2, H // 2 + 30), shadow=False)
+            draw_text(screen, self.tiny_font, "ESC  BACK TO MATCH REPORT",
+                      GOLD, (W // 2, H - 88), shadow=False)
+            self._draw_replay_button(self.replay_back_rect, "BACK TO REPORT [ESC]")
+            pygame.display.flip()
+            return
+
+        clip = self.goal_replays[self.replay_clip_i]
+        frames = clip.get("frames", [])
+        if not frames or self.replay_actor1 is None or self.replay_actor2 is None:
+            draw_text(screen, self.big_font, "REPLAY UNAVAILABLE", WHITE, (W // 2, H // 2))
+            self._draw_replay_button(self.replay_back_rect, "BACK TO REPORT [ESC]")
+            pygame.display.flip()
+            return
+        idx = int(clamp(round(self.replay_cursor), 0, len(frames) - 1))
+        frame = frames[idx]
+        cv = self.canvas
+        if self.field_surface is None:
+            self.field_surface = self.build_field_surface()
+        cv.blit(self.field_surface, (0, 0))
+
+        # Playback uses separate replay actors so the finished match state stays untouched.
+        def apply_state(actor, state):
+            actor.x, actor.y = state["x"], state["y"]
+            actor.vx, actor.vy = state["vx"], state["vy"]
+            actor.facing_x, actor.facing_y = state["fx"], state["fy"]
+            actor.animation_time = state["anim"]
+            actor.squash = state["squash"]
+            actor.kick_timer = state["kick"]
+            actor.tackle_timer = state["tackle"]
+            actor.flash_timer = state["flash"]
+            actor.stamina = state["stamina"]
+            actor.exhausted = state["exhausted"]
+            actor.charging = state["charging"]
+            actor.charge = state["charge"]
+            actor.boost_t = state["boost"]
+            actor.mega_t = state["mega"]
+            actor.frozen_t = state["frozen"]
+
+        apply_state(self.replay_actor1, frame["p1"])
+        apply_state(self.replay_actor2, frame["p2"])
+
+        self.fx_layer.fill((0, 0, 0, 0))
+        trail = frame.get("trail", [])
+        for i, (tx, ty) in enumerate(trail):
+            alpha = int(25 + 115 * (i + 1) / max(1, len(trail)))
+            rr = max(2, int(13 * (i + 1) / max(1, len(trail))))
+            pygame.draw.circle(self.fx_layer, (238, 247, 255, alpha), (int(tx), int(ty)), rr)
+        cv.blit(self.fx_layer, (0, 0))
+
+        for actor in sorted((self.replay_actor1, self.replay_actor2), key=lambda q: q.y):
+            actor.draw(cv)
+        draw_ball(cv, frame["bx"], frame["by"], 13, frame["br"])
+
+        # A gentle zoom follows the scoring action, like a TV replay camera.
+        progress = idx / max(1, len(frames) - 1)
+        zoom = 1.0 + 0.095 * (0.5 - 0.5 * math.cos(math.pi * progress))
+        sw, sh = int(W * zoom), int(H * zoom)
+        scaled = pygame.transform.smoothscale(cv, (sw, sh)) if zoom > 1.001 else cv
+        if zoom > 1.001:
+            cx = frame["bx"] * zoom
+            cy = frame["by"] * zoom
+            crop_x = int(clamp(cx - W / 2, 0, sw - W))
+            crop_y = int(clamp(cy - H / 2, 0, sh - H))
+            screen.blit(scaled, (0, 0), pygame.Rect(crop_x, crop_y, W, H))
+        else:
+            screen.blit(scaled, (0, 0))
+
+        # Letterbox bars and broadcast-style HUD.
+        pygame.draw.rect(screen, (2, 5, 9), (0, 0, W, 80))
+        pygame.draw.rect(screen, (2, 5, 9), (0, H - 108, W, 108))
+        pygame.draw.rect(screen, GOLD, (26, 24, 8, 34), border_radius=3)
+        draw_text(screen, self.tiny_font, "HYPER SOCCER  /  INSTANT REPLAY",
+                  (173, 190, 199), (48, 16), anchor="topleft", shadow=False)
+        side = int(clip.get("side", 1))
+        team_col = self.p1.color if side == 1 else self.p2.color
+        draw_text(screen, self.font, f"GOAL REPLAY  ·  {self.side_name(side)}",
+                  team_col, (W // 2, 45), shadow=False)
+        secs = int(max(0, frame.get("clock", 0)))
+        stamp = f"{secs // 60:02d}:{secs % 60:02d}"
+        draw_text(screen, self.small_font, stamp, WHITE, (W - 44, 43), anchor="midright", shadow=False)
+
+        # Timeline with an animated progress marker and clip count.
+        bar = pygame.Rect(220, H - 83, W - 440, 8)
+        pygame.draw.rect(screen, (49, 65, 75), bar, border_radius=4)
+        progress_bar = idx / max(1, len(frames) - 1)
+        if progress_bar > 0:
+            pygame.draw.rect(screen, team_col,
+                             (bar.x, bar.y, max(4, int(bar.w * progress_bar)), bar.h), border_radius=4)
+        knob_x = int(bar.x + bar.w * progress_bar)
+        pygame.draw.circle(screen, WHITE, (knob_x, bar.centery), 6)
+        draw_text(screen, self.tiny_font,
+                  f"CLIP {self.replay_clip_i + 1} / {len(self.goal_replays)}   ·   SLOW-MOTION",
+                  (164, 184, 194), (W // 2, H - 93), shadow=False)
+
+        self._draw_replay_button(self.replay_back_rect, "BACK TO REPORT [ESC]")
+        self._draw_replay_button(self.replay_pause_rect,
+                                 "PAUSE [SPACE]" if self.replay_playing else "PLAY [SPACE]")
+        self._draw_replay_button(self.replay_next_rect, "NEXT CLIP [RIGHT]")
+        pygame.display.flip()
+
+    def _draw_replay_button(self, rect, label):
+        hover = rect.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(screen, (31, 48, 59) if hover else (17, 29, 39), rect,
+                         border_radius=10)
+        pygame.draw.rect(screen, GOLD if hover else (69, 90, 100), rect,
+                         2 if hover else 1, border_radius=10)
+        draw_text(screen, self.tiny_font, label, GOLD if hover else WHITE,
+                  rect.center, shadow=False)
 
     def draw_stats_panel(self):
         st = self.stats
@@ -3476,6 +4621,27 @@ class Game:
             bw = int(bar.w * frac)
             if bw > 0:
                 pygame.draw.rect(screen, BLUE, (bar.x, bar.y, bw, bar.h), border_radius=5)
+
+
+    def draw_touch_controls(self):
+        if self.state not in ("play", "countdown", "goal"):
+            return
+        labels = {"up": "▲", "down": "▼", "left": "◀", "right": "▶",
+                  "dash": "DASH", "tackle": "TACKLE", "shoot": "SHOOT"}
+        for name, rect in self.touch_rects().items():
+            side, action = name.split("_", 1)
+            col = BLUE if side == "p1" else RED
+            active = name in self.touch_held
+            layer = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+            pygame.draw.rect(layer, (*col, 210 if active else 125), layer.get_rect(), border_radius=15)
+            pygame.draw.rect(layer, (255, 255, 255, 230 if active else 155),
+                             layer.get_rect(), 2, border_radius=15)
+            screen.blit(layer, rect.topleft)
+            font = self.font if action in ("up", "down", "left", "right") else self.tiny_font
+            draw_text(screen, font, labels[action], WHITE, rect.center, shadow=False)
+        draw_text(screen, self.tiny_font, "BLUE", BLUE_LIGHT, (100, H - 42), shadow=False)
+        if self.mode == "pvp":
+            draw_text(screen, self.tiny_font, "RED", RED_LIGHT, (W - 100, H - 42), shadow=False)
 
     def draw(self):
         if self.state == "menu":
@@ -3508,10 +4674,23 @@ class Game:
             self.draw_fade()
             pygame.display.flip()
             return
+        if self.state == "upgrades":
+            self.draw_upgrade_shop()
+            self.draw_fade()
+            pygame.display.flip()
+            return
         if self.state in ("penalties", "penalty_finished"):
             self.draw_penalties()
             self.draw_fade()
             pygame.display.flip()
+            return
+        if self.state == "finished":
+            self.draw_match_highlights()
+            self.draw_fade()
+            pygame.display.flip()
+            return
+        if self.state == "replay":
+            self.draw_replay_viewer()
             return
 
         if self.field_surface is None:
@@ -3606,6 +4785,12 @@ class Game:
         screen.blit(cv, (offx, offy))
 
         self.draw_hud()
+        self.draw_touch_controls()
+        if self.coin_timer > 0 and self.coin_message and self.state not in ("finished", "replay"):
+            toast = pygame.Rect(W // 2 - 200, 112, 400, 42)
+            pygame.draw.rect(screen, (18, 28, 35), toast, border_radius=12)
+            pygame.draw.rect(screen, GOLD, toast, 2, border_radius=12)
+            draw_text(screen, self.small_font, self.coin_message, GOLD, toast.center, shadow=False)
 
         if self.state == "countdown":
             part = self.countdown_total / 3.0
@@ -3626,26 +4811,6 @@ class Game:
             flash.fill((255, 255, 255, int(80 * self.goal_flash / 22)))
             screen.blit(flash, (0, 0))
 
-        if self.state == "finished":
-            if self.blue_score > self.red_score:
-                winner, color = f"{self.side_name(1)} WINS!", BLUE
-            elif self.red_score > self.blue_score:
-                winner, color = f"{self.side_name(2)} WINS!", RED
-            else:
-                winner, color = "DRAW!", GOLD
-            if self.mode == "host":
-                hint = "SPACE  REMATCH        M / ESC  LOBBY"
-            elif self.mode == "client":
-                hint = "WAITING FOR THE HOST...        ESC  LEAVE"
-            else:
-                hint = "SPACE  PLAY AGAIN        ESC  MENU"
-            self.draw_overlay_text(winner, color, [f"{self.blue_score}  -  {self.red_score}", hint])
-            self.draw_stats_panel()
-            self.fx_layer.fill((0, 0, 0, 0))
-            for p in self.particles:
-                p.draw(self.fx_layer)
-            screen.blit(self.fx_layer, (0, 0))
-
         if self.state == "paused":
             self.draw_overlay_text("PAUSED", WHITE, ["ESC  RESUME        M  MENU"])
 
@@ -3658,7 +4823,7 @@ class Game:
             f.set_alpha(int(self.fade))
             screen.blit(f, (0, 0))
 
-    def run(self):
+    async def run(self):
         while self.running:
             ms = clock.tick(FPS)
             dt = min(ms / (1000.0 / 60.0), 2.5)
@@ -3667,14 +4832,16 @@ class Game:
                 break
             self.update(dt)
             self.draw()
+            # Yield to the browser so it can render, process touch input and update the page.
+            await asyncio.sleep(0)
         self.net_shutdown()
 
 
-def main():
+async def main():
     game = None
     try:
         game = Game()
-        game.run()
+        await game.run()
     except KeyboardInterrupt:
         pass
     finally:
@@ -3683,8 +4850,11 @@ def main():
                 game.net_shutdown()
         except Exception:
             pass
-        pygame.quit()
+        # Pygbag owns the browser runtime; do not tear down pygame on WebAssembly.
+        if not WEB_BUILD:
+            pygame.quit()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
