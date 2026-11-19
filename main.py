@@ -47,7 +47,7 @@ MATCH_SECONDS = 90
 NET_PORT = 47821     # UDP port the host listens on
 PROTO = 2            # bump when the network protocol changes
 MAGIC = "HSOC"
-INTERP_DELAY = 0.07  # seconds the guest renders behind the host (smooths jitter)
+INTERP_DELAY = 0.105  # seconds behind the host; gives WebSocket jitter room to settle
 
 MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades")
 GAME_STATES = ("countdown", "play", "goal", "finished")
@@ -163,6 +163,21 @@ def clamp(value, low, high):
 
 def lerp(a, b, t):
     return a + (b - a) * t
+
+
+def hermite(a, b, va, vb, t, span_seconds):
+    """Interpolate positions using snapshot velocities (velocities are per 60-Hz frame)."""
+    t = clamp(t, 0.0, 1.0)
+    t2, t3 = t * t, t * t * t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+    duration = max(0.0, span_seconds) * 60.0
+    value = h00 * a + h10 * duration * va + h01 * b + h11 * duration * vb
+    # Guard against brief network corrections causing the cubic curve to overshoot.
+    margin = max(5.0, abs(b - a) * 0.12)
+    return clamp(value, min(a, b) - margin, max(a, b) + margin)
 
 
 def ease(a, dt):
@@ -1501,12 +1516,15 @@ class Game:
         self.canvas = pygame.Surface((W, H))
         self.field_surface = None
         self.vignette = self.build_vignette()
+        self.menu_backdrop = self.build_menu_backdrop()
 
         self.bot_state = {"think": 0.0, "tx": W * 0.7, "ty": FIELD_CY, "lull": 0.0}
 
         self.running = True
         self.touch_held = set()
         self.touch_pointer_map = {}
+        self.joystick_values = {"p1": (0.0, 0.0), "p2": (0.0, 0.0)}
+        self.touch_controls_enabled = self.detect_touch_device()
         self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 1}
         self.sound = Sound()
         self.profile = self.load_profile()
@@ -1566,6 +1584,7 @@ class Game:
         self.match_id = 0
         self.cur_mid = 0
         self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False, "tk": 0, "t": 0.0}
+        self.net_axes = {"dx": 0.0, "dy": 0.0}
         self.p2_sh_prev = False
         self.p2_tk_prev = 0
         self.ev_log = []
@@ -1629,6 +1648,46 @@ class Game:
         self.apply_shape(self.menu_p1, self.shape_indices[0])
         self.apply_shape(self.menu_p2, self.shape_indices[1])
         self.apply_profile_to_player(self.menu_p1)
+
+    def detect_touch_device(self):
+        """Show the virtual controller only on phone/tablet browsers, never desktop browsers."""
+        if not WEB_BUILD:
+            return False
+        try:
+            return bool(platform.window.eval(
+                "(function(){var ua=navigator.userAgent||'';"
+                "var mobile=/Android|iPhone|iPod|Mobile|iPad/i.test(ua);"
+                "var ipadOS=/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1&&screen.width<1400;"
+                "var touch=mobile||ipadOS;"
+                "if(touch){document.documentElement.style.overflow='hidden';"
+                "document.body.style.margin='0';document.body.style.overflow='hidden';"
+                "document.body.style.background='#060c1b';document.body.style.touchAction='none';"
+                "var c=document.querySelector('canvas');if(c){c.style.touchAction='none';"
+                "c.style.userSelect='none';c.style.webkitUserSelect='none';}}"
+                "return touch;})()"
+            ))
+        except Exception:
+            return False
+
+    def joystick_center(self, side):
+        return (96, H - 142) if side == "p1" else (W - 96, H - 142)
+
+    def update_joystick(self, side, pos):
+        cx, cy = self.joystick_center(side)
+        radius = 66.0
+        dx = (float(pos[0]) - cx) / radius
+        dy = (float(pos[1]) - cy) / radius
+        length = math.hypot(dx, dy)
+        if length > 1.0:
+            dx, dy = dx / length, dy / length
+            length = 1.0
+        dead_zone = 0.12
+        if length <= dead_zone:
+            self.joystick_values[side] = (0.0, 0.0)
+        else:
+            strength = (length - dead_zone) / (1.0 - dead_zone)
+            self.joystick_values[side] = (dx / max(length, 1e-6) * strength,
+                                          dy / max(length, 1e-6) * strength)
 
     # --------------------------------------------------------
     # STATE
@@ -2161,6 +2220,7 @@ class Game:
                         self.guest_last = now
                         self.lobby_names = [self.name, self.guest_name]
                         self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False, "tk": 0, "t": 0.0}
+                        self.net_axes = {"dx": 0.0, "dy": 0.0}
                         self.lobby_send_t = -10.0
                         self.net_msg = ""
                         net.send({"t": "welcome", "names": self.lobby_names}, addr)
@@ -2449,7 +2509,11 @@ class Game:
                 if buf[i]["ht"] <= rt <= buf[i + 1]["ht"]:
                     a, b = buf[i], buf[i + 1]
                     break
-        f = 0.0 if a is b else clamp((rt - a["ht"]) / max(1e-6, b["ht"] - a["ht"]), 0.0, 1.0)
+        span_seconds = 0.0 if a is b else max(1e-6, b["ht"] - a["ht"])
+        f = 0.0 if a is b else clamp((rt - a["ht"]) / span_seconds, 0.0, 1.0)
+        # A tiny velocity-based prediction covers a late WebSocket packet without freezing
+        # the guest's view at the last received position. It is deliberately time-limited.
+        extrapolate = min(0.065, max(0.0, rt - buf[-1]["ht"])) if rt > buf[-1]["ht"] else 0.0
 
         # Match flow comes from the newest-bracket snapshot.
         new_state = IDX_STATE.get(int(b["st"]), "play")
@@ -2478,8 +2542,16 @@ class Game:
         for p, pa, pb in ((self.p1, a["p"][0], b["p"][0]), (self.p2, a["p"][1], b["p"][1])):
             jump = math.hypot(pb[0] - pa[0], pb[1] - pa[1]) > 150     # kickoff reset: don't slide
             ff = 1.0 if jump else f
-            p.x = lerp(pa[0], pb[0], ff)
-            p.y = lerp(pa[1], pb[1], ff)
+            if a is not b and not jump:
+                p.x = hermite(pa[0], pb[0], pa[2], pb[2], ff, span_seconds)
+                p.y = hermite(pa[1], pb[1], pa[3], pb[3], ff, span_seconds)
+            else:
+                p.x, p.y = float(pb[0]), float(pb[1])
+            if extrapolate > 0.0 and a is b and not jump:
+                p.x += float(pb[2]) * 60.0 * extrapolate
+                p.y += float(pb[3]) * 60.0 * extrapolate
+            p.x = clamp(p.x, FIELD_LEFT + p.radius, FIELD_RIGHT - p.radius)
+            p.y = clamp(p.y, FIELD_TOP + p.radius, FIELD_BOTTOM - p.radius)
             p.vx = lerp(pa[2], pb[2], ff)
             p.vy = lerp(pa[3], pb[3], ff)
             fx, fy = lerp(pa[4], pb[4], ff), lerp(pa[5], pb[5], ff)
@@ -2505,8 +2577,14 @@ class Game:
         ball = self.ball
         jump = math.hypot(bb[0] - ba[0], bb[1] - ba[1]) > 150
         ff = 1.0 if jump else f
-        ball.x = lerp(ba[0], bb[0], ff)
-        ball.y = lerp(ba[1], bb[1], ff)
+        if a is not b and not jump:
+            ball.x = hermite(ba[0], bb[0], ba[2], bb[2], ff, span_seconds)
+            ball.y = hermite(ba[1], bb[1], ba[3], bb[3], ff, span_seconds)
+        else:
+            ball.x, ball.y = float(bb[0]), float(bb[1])
+        if extrapolate > 0.0 and a is b and not jump:
+            ball.x += float(bb[2]) * 60.0 * extrapolate
+            ball.y += float(bb[3]) * 60.0 * extrapolate
         ball.vx, ball.vy = float(bb[2]), float(bb[3])
         ball.rotation = float(bb[5])
         owner = int(bb[4])
@@ -2801,9 +2879,16 @@ class Game:
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             if self.handle_touch_pointer("mouse", event.pos, False):
                 return
+        elif event.type == pygame.MOUSEMOTION and "mouse" in self.touch_pointer_map:
+            if self.handle_touch_motion("mouse", event.pos):
+                return
         elif event.type == pygame.FINGERDOWN:
             pos = (int(event.x * W), int(event.y * H))
             if self.state == "play" and self.handle_touch_pointer(("finger", event.finger_id), pos, True):
+                return
+        elif event.type == pygame.FINGERMOTION:
+            pos = (int(event.x * W), int(event.y * H))
+            if self.handle_touch_motion(("finger", event.finger_id), pos):
                 return
         elif event.type == pygame.FINGERUP:
             if self.handle_touch_pointer(("finger", event.finger_id), (0, 0), False):
@@ -3094,6 +3179,9 @@ class Game:
                 self.c_tackle += 1
             else:
                 player.tackle_buffer = 8.0
+        elif action == "dash":
+            # Dash is read continuously from touch_held by combined_input/read_inputs.
+            pass
 
     def touch_up(self, name):
         if name not in self.touch_held:
@@ -3107,30 +3195,48 @@ class Game:
                 self.release_shot(self.p2 if side == "p2" else self.p1)
 
     def touch_rects(self):
-        def pad(cx, cy, side):
-            return {
-                side + "_up": pygame.Rect(cx - 25, cy - 78, 50, 50),
-                side + "_down": pygame.Rect(cx - 25, cy + 28, 50, 50),
-                side + "_left": pygame.Rect(cx - 78, cy - 25, 50, 50),
-                side + "_right": pygame.Rect(cx + 28, cy - 25, 50, 50),
-            }
-        rects = pad(100, H - 135, "p1")
-        rects.update({
-            "p1_dash": pygame.Rect(235, H - 205, 76, 58),
-            "p1_tackle": pygame.Rect(235, H - 137, 76, 58),
-            "p1_shoot": pygame.Rect(320, H - 171, 94, 94),
-        })
+        """Circular action hit areas; the move stick is handled as an analog pointer zone."""
+        if not self.touch_controls_enabled:
+            return {}
+        def circle(cx, cy, radius):
+            return pygame.Rect(cx - radius, cy - radius, radius * 2, radius * 2)
+
         if self.mode == "pvp":
-            rects.update(pad(W - 100, H - 135, "p2"))
-            rects.update({
-                "p2_dash": pygame.Rect(W - 311, H - 205, 76, 58),
-                "p2_tackle": pygame.Rect(W - 311, H - 137, 76, 58),
-                "p2_shoot": pygame.Rect(W - 414, H - 171, 94, 94),
-            })
+            rects = {
+                "p1_dash": circle(225, H - 220, 37),
+                "p1_tackle": circle(225, H - 125, 37),
+                "p1_shoot": circle(335, H - 172, 49),
+                "p2_dash": circle(W - 225, H - 220, 37),
+                "p2_tackle": circle(W - 225, H - 125, 37),
+                "p2_shoot": circle(W - 335, H - 172, 49),
+            }
+        else:
+            rects = {
+                "p1_dash": circle(W - 225, H - 220, 37),
+                "p1_tackle": circle(W - 225, H - 125, 37),
+                "p1_shoot": circle(W - 112, H - 170, 51),
+            }
         return rects
 
+    def _joystick_side_at(self, pos):
+        if not self.touch_controls_enabled:
+            return None
+        sides = ("p1", "p2") if self.mode == "pvp" else ("p1",)
+        for side in sides:
+            cx, cy = self.joystick_center(side)
+            if math.hypot(pos[0] - cx, pos[1] - cy) <= 78:
+                return side
+        return None
+
     def handle_touch_pointer(self, pointer_id, pos, down):
+        if not self.touch_controls_enabled:
+            return False
         if down:
+            side = self._joystick_side_at(pos)
+            if side:
+                self.touch_pointer_map[pointer_id] = side + "_joystick"
+                self.update_joystick(side, pos)
+                return True
             for name, rect in self.touch_rects().items():
                 if rect.collidepoint(pos):
                     self.touch_pointer_map[pointer_id] = name
@@ -3139,33 +3245,51 @@ class Game:
         else:
             name = self.touch_pointer_map.pop(pointer_id, None)
             if name:
-                self.touch_up(name)
+                if name.endswith("_joystick"):
+                    side = name.split("_", 1)[0]
+                    self.joystick_values[side] = (0.0, 0.0)
+                else:
+                    self.touch_up(name)
                 return True
         return False
 
+    def handle_touch_motion(self, pointer_id, pos):
+        name = self.touch_pointer_map.get(pointer_id)
+        if not name or not name.endswith("_joystick"):
+            return False
+        side = name.split("_", 1)[0]
+        self.update_joystick(side, pos)
+        return True
+
     def combined_input(self, keys):
+        jx, jy = self.joystick_values["p1"]
         dx = (int(keys[pygame.K_d]) - int(keys[pygame.K_a])
-              + int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
-              + int("p1_right" in self.touch_held) - int("p1_left" in self.touch_held))
+              + int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]) + jx)
         dy = (int(keys[pygame.K_s]) - int(keys[pygame.K_w])
-              + int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
-              + int("p1_down" in self.touch_held) - int("p1_up" in self.touch_held))
+              + int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]) + jy)
+        length = math.hypot(dx, dy)
+        if length > 1.0:
+            dx, dy = dx / length, dy / length
         dash = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH]
                     or "p1_dash" in self.touch_held)
-        return clamp(dx, -1, 1), clamp(dy, -1, 1), dash
+        return dx, dy, dash
 
     def read_inputs(self, keys):
         if self.mode == "pvp":
-            in1 = (clamp(int(keys[pygame.K_d]) - int(keys[pygame.K_a])
-                         + int("p1_right" in self.touch_held) - int("p1_left" in self.touch_held), -1, 1),
-                   clamp(int(keys[pygame.K_s]) - int(keys[pygame.K_w])
-                         + int("p1_down" in self.touch_held) - int("p1_up" in self.touch_held), -1, 1),
-                   bool(keys[pygame.K_LSHIFT] or "p1_dash" in self.touch_held))
-            in2 = (clamp(int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
-                         + int("p2_right" in self.touch_held) - int("p2_left" in self.touch_held), -1, 1),
-                   clamp(int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
-                         + int("p2_down" in self.touch_held) - int("p2_up" in self.touch_held), -1, 1),
-                   bool(keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH] or "p2_dash" in self.touch_held))
+            j1x, j1y = self.joystick_values["p1"]
+            j2x, j2y = self.joystick_values["p2"]
+            dx1 = int(keys[pygame.K_d]) - int(keys[pygame.K_a]) + j1x
+            dy1 = int(keys[pygame.K_s]) - int(keys[pygame.K_w]) + j1y
+            dx2 = int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]) + j2x
+            dy2 = int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]) + j2y
+            l1, l2 = math.hypot(dx1, dy1), math.hypot(dx2, dy2)
+            if l1 > 1.0:
+                dx1, dy1 = dx1 / l1, dy1 / l1
+            if l2 > 1.0:
+                dx2, dy2 = dx2 / l2, dy2 / l2
+            in1 = (dx1, dy1, bool(keys[pygame.K_LSHIFT] or "p1_dash" in self.touch_held))
+            in2 = (dx2, dy2, bool(keys[pygame.K_RSHIFT] or keys[pygame.K_SLASH]
+                                   or "p2_dash" in self.touch_held))
             return in1, in2
         return self.combined_input(keys), None
 
@@ -3264,10 +3388,14 @@ class Game:
             self.p2.update(*in2, dt, self.particles)
         elif self.mode == "host":
             ni = self.net_in
-            if time.perf_counter() - ni["t"] > 0.5:
-                self.p2.update(0, 0, False, dt, self.particles)
-            else:
-                self.p2.update(ni["dx"], ni["dy"], ni["dash"], dt, self.particles)
+            fresh = time.perf_counter() - ni["t"] <= 0.5
+            target_x = float(ni["dx"]) if fresh else 0.0
+            target_y = float(ni["dy"]) if fresh else 0.0
+            blend = ease(0.52, dt)
+            self.net_axes["dx"] = lerp(self.net_axes["dx"], target_x, blend)
+            self.net_axes["dy"] = lerp(self.net_axes["dy"], target_y, blend)
+            self.p2.update(self.net_axes["dx"], self.net_axes["dy"],
+                           bool(ni["dash"] and fresh), dt, self.particles)
         else:
             self.p2.update(*self.bot_inputs(dt), dt, self.particles)
             self.bot_actions(dt)
@@ -3769,9 +3897,10 @@ class Game:
             p.tick_timers(dt)
         # Ambient drifting motes.
         if random.random() < 0.25 * dt:
+            mote_col = random.choice(((92, 195, 255), (169, 125, 255), (255, 125, 205)))
             self.particles.append(Particle(
                 random.uniform(0, W), H + 10, random.uniform(-0.3, 0.3), random.uniform(-1.4, -0.6),
-                (200, 240, 200), random.randint(2, 4), random.randint(120, 200)))
+                mote_col, random.randint(2, 4), random.randint(120, 200)))
         self.update_particles(dt)
 
     # --------------------------------------------------------
@@ -3786,27 +3915,51 @@ class Game:
             pygame.draw.rect(v, (0, 0, 0, a), (i, i, W - 2 * i, H - 2 * i), 1)
         return v
 
+    def build_menu_backdrop(self):
+        """Build the static midnight-stadium artwork once for fast browser rendering."""
+        bg = pygame.Surface((W, H))
+        top = (6, 12, 27)
+        bottom = (13, 32, 49)
+        for y in range(H):
+            f = y / max(1, H - 1)
+            col = tuple(int(lerp(top[i], bottom[i], f)) for i in range(3))
+            pygame.draw.line(bg, col, (0, y), (W, y))
+
+        # Quiet stadium seating, a broad pitch arc and perspective floor markings.
+        for i in range(8):
+            col = (17 + i, 29 + i, 45 + i)
+            pygame.draw.ellipse(bg, col, (-190 - i * 8, 145 - i * 7,
+                                         W + 380 + i * 16, 520 + i * 18), 1)
+        pygame.draw.ellipse(bg, (28, 55, 72), (190, 270, W - 380, 360), 2)
+        pygame.draw.line(bg, (23, 48, 65), (W // 2, 270), (W // 2, H), 2)
+        pygame.draw.circle(bg, (23, 48, 65), (W // 2, 450), 76, 2)
+        pygame.draw.circle(bg, (23, 48, 65), (W // 2, 450), 4)
+        for i in range(1, 8):
+            x = int(i * W / 8)
+            pygame.draw.line(bg, (15, 34, 52), (x, 0), (W // 2 + (x - W // 2) * 1.45, H), 1)
+        # Distant floodlight dots.
+        for x in (95, 300, W - 300, W - 95):
+            pygame.draw.circle(bg, (42, 68, 89), (x, 88), 3)
+            pygame.draw.circle(bg, (24, 43, 62), (x, 88), 17, 1)
+        return bg
+
     def draw_menu_bg(self):
         t = self.menu_t
-        screen.fill((10, 27, 16))
+        if not hasattr(self, "menu_backdrop"):
+            self.menu_backdrop = self.build_menu_backdrop()
+        screen.blit(self.menu_backdrop, (0, 0))
 
-        stripe = 120
-        off = (t * 0.5) % (stripe * 2)
-        x = -stripe * 2 + off
-        i = 0
-        while x < W:
-            pygame.draw.rect(screen, FIELD if i % 2 == 0 else FIELD_DARK, (int(x), 0, stripe + 1, H))
-            x += stripe
-            i += 1
+        # Slow moving cyan and violet light shafts, drawn directly for mobile performance.
+        for i, base_x in enumerate((90, 360, 840, 1110)):
+            drift = math.sin(t * 0.012 + i * 1.7) * 42
+            x = int(base_x + drift)
+            col = (11, 31, 49) if i % 2 == 0 else (27, 24, 49)
+            pygame.draw.polygon(screen, col, [(x - 15, 0), (x + 15, 0),
+                                              (x + 110, H), (x - 110, H)])
 
-        overlay = pygame.Surface((W, H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 80))
-        screen.blit(overlay, (0, 0))
-
-        pulse = 150 + math.sin(t * 0.03) * 8
-        pygame.draw.circle(screen, (235, 245, 235), (W // 2, H // 2 + 20), int(pulse), 3)
-        pygame.draw.line(screen, (235, 245, 235), (W // 2, 0), (W // 2, H), 2)
-        pygame.draw.circle(screen, WHITE, (W // 2, H // 2 + 20), 5)
+        pulse = 142 + math.sin(t * 0.025) * 8
+        pygame.draw.circle(screen, (26, 66, 83), (W // 2, 430), int(pulse), 2)
+        pygame.draw.circle(screen, (34, 39, 70), (W // 2, 430), int(pulse + 18), 2)
 
         self.fx_layer.fill((0, 0, 0, 0))
         for p in self.particles:
@@ -3817,17 +3970,28 @@ class Game:
         t = self.menu_t
         rect = base_rect.copy()
         if selected:
-            grow = int(4 + math.sin(t * 0.12) * 2)
+            grow = int(3 + math.sin(t * 0.12) * 2)
             rect.inflate_ip(grow * 2, grow)
-            glow = pygame.Surface((rect.w + 40, rect.h + 40), pygame.SRCALPHA)
-            pygame.draw.rect(glow, (*GOLD, 40), glow.get_rect(), border_radius=28)
-            screen.blit(glow, (rect.x - 20, rect.y - 20))
-        pygame.draw.rect(screen, UI_LIGHT if selected else UI, rect, border_radius=18)
-        pygame.draw.rect(screen, GOLD if selected else (90, 100, 105), rect, 3, border_radius=18)
-        draw_text(screen, self.menu_font, name, GOLD if selected else WHITE,
-                  (rect.centerx, rect.top + int(rect.h * 0.33)), shadow=False)
-        draw_text(screen, self.small_font, desc, (205, 215, 210),
-                  (rect.centerx, rect.top + int(rect.h * 0.72)), shadow=False)
+            pygame.draw.rect(screen, (19, 47, 68), rect.inflate(14, 10),
+                             2, border_radius=23)
+
+        # Drop shadow and glass-dark panel.
+        pygame.draw.rect(screen, (3, 8, 17), rect.move(0, 5), border_radius=20)
+        pygame.draw.rect(screen, (17, 29, 46) if selected else (11, 21, 36),
+                         rect, border_radius=18)
+        border = (73, 211, 255) if selected else (58, 82, 105)
+        pygame.draw.rect(screen, border, rect, 2 if selected else 1, border_radius=18)
+        pygame.draw.line(screen, (40, 110, 145) if selected else (30, 52, 73),
+                         (rect.left + 20, rect.top + 3), (rect.right - 20, rect.top + 3), 2)
+        if selected:
+            pulse = int(165 + 70 * (0.5 + 0.5 * math.sin(t * 0.16)))
+            pygame.draw.rect(screen, (36, pulse, 240),
+                             (rect.left + 10, rect.top + 12, 5, rect.h - 24),
+                             border_radius=3)
+        draw_text(screen, self.menu_font, name, (103, 220, 255) if selected else WHITE,
+                  (rect.centerx, rect.top + int(rect.h * 0.34)), shadow=False)
+        draw_text(screen, self.small_font, desc, (180, 199, 215),
+                  (rect.centerx, rect.top + int(rect.h * 0.75)), shadow=False)
 
     def draw_menu(self):
         t = self.menu_t
@@ -3848,7 +4012,14 @@ class Game:
         self.menu_p2.draw(screen)
         draw_ball(screen, bx, ground - height - 4, 13, t * 0.15, ground - 4)
 
-        # Title with wavy letters.
+        # Title sits on a restrained neon plate so it reads clearly over the stadium.
+        title_plate = pygame.Rect(W // 2 - 340, 39, 680, 100)
+        plate = pygame.Surface((title_plate.w, title_plate.h), pygame.SRCALPHA)
+        pygame.draw.rect(plate, (4, 12, 26, 155), plate.get_rect(), border_radius=26)
+        pygame.draw.rect(plate, (76, 166, 205, 100), plate.get_rect(), 2, border_radius=26)
+        screen.blit(plate, title_plate.topleft)
+        draw_text(screen, self.tiny_font, "ARCADE  •  FOOTBALL  •  ONLINE",
+                  (126, 190, 212), (W // 2, 49), shadow=False)
         words = [("HYPER", BLUE_LIGHT), ("SOCCER", RED_LIGHT)]
         total_w = sum(self.title_font.size(w)[0] for w, _ in words) + 36
         cx = W // 2 - total_w // 2
@@ -3856,16 +4027,20 @@ class Game:
             for ch in word:
                 gw = self.title_font.size(ch)[0]
                 k = (cx - W // 2) * 0.012
-                yo = math.sin(t * 0.05 + k) * 7
+                yo = math.sin(t * 0.05 + k) * 5
                 img = self.title_font.render(ch, True, col)
+                glow = self.title_font.render(ch, True, col)
+                glow.set_alpha(65)
+                screen.blit(glow, (cx + 2, 72 + yo + 2))
                 sh = self.title_font.render(ch, True, (0, 0, 0))
-                sh.set_alpha(170)
-                screen.blit(sh, (cx + 4, 56 + yo + 5))
-                screen.blit(img, (cx, 56 + yo))
+                sh.set_alpha(180)
+                screen.blit(sh, (cx + 3, 72 + yo + 4))
+                screen.blit(img, (cx, 72 + yo))
                 cx += gw
             cx += 36
+        pygame.draw.line(screen, (58, 181, 221), (W // 2 - 220, 145), (W // 2 + 220, 145), 2)
         draw_text(screen, self.small_font, "LOCAL SOCCER  -  CHOOSE YOUR GAME MODE",
-                  (220, 235, 220), (W // 2, 160))
+                  (190, 220, 235), (W // 2, 166))
 
         options = [
             ("1 V 1", "Play against another player on this device"),
@@ -4789,25 +4964,66 @@ class Game:
                 pygame.draw.rect(screen, BLUE, (bar.x, bar.y, bw, bar.h), border_radius=5)
 
 
+    def draw_virtual_stick(self, side):
+        cx, cy = self.joystick_center(side)
+        vx, vy = self.joystick_values[side]
+        col = BLUE_LIGHT if side == "p1" else RED_LIGHT
+        radius = 62
+        knob_x = int(cx + vx * 29)
+        knob_y = int(cy + vy * 29)
+
+        pygame.draw.circle(screen, (4, 11, 22), (cx, cy), radius + 9)
+        pygame.draw.circle(screen, (27, 49, 66), (cx, cy), radius + 5, 3)
+        pygame.draw.circle(screen, (20, 31, 47), (cx, cy), radius)
+        pygame.draw.circle(screen, (135, 169, 193), (cx, cy), radius, 2)
+        # Twelve notches give the stick the segmented hardware look.
+        for i in range(12):
+            ang = i * math.tau / 12
+            inner, outer = radius - 6, radius + 2
+            a = (int(cx + math.cos(ang) * inner), int(cy + math.sin(ang) * inner))
+            b = (int(cx + math.cos(ang) * outer), int(cy + math.sin(ang) * outer))
+            pygame.draw.line(screen, (205, 225, 238), a, b, 3)
+        pygame.draw.circle(screen, (5, 10, 20), (cx, cy), 36)
+        pygame.draw.circle(screen, (54, 89, 114), (cx, cy), 34, 3)
+        pygame.draw.circle(screen, (116, 139, 158), (cx, cy), 27)
+        pygame.draw.circle(screen, (38, 49, 64), (cx, cy), 22)
+        pygame.draw.circle(screen, (220, 232, 241), (cx - 7, cy - 8), 7)
+
+        # Thumb knob moves within the well with the player's analog direction.
+        pygame.draw.circle(screen, (5, 12, 24), (knob_x, knob_y), 21)
+        pygame.draw.circle(screen, col, (knob_x, knob_y), 21, 2)
+        pygame.draw.circle(screen, (145, 177, 197), (knob_x, knob_y), 15)
+        pygame.draw.circle(screen, (45, 58, 75), (knob_x, knob_y), 12)
+        pygame.draw.circle(screen, (225, 238, 247), (knob_x - 5, knob_y - 6), 4)
+        draw_text(screen, self.tiny_font, "MOVE", (206, 225, 238),
+                  (cx, cy + 84), shadow=True)
+
+    def draw_action_button(self, name, rect, side, label):
+        active = name in self.touch_held
+        col = BLUE_LIGHT if side == "p1" else RED_LIGHT
+        radius = min(rect.w, rect.h) // 2
+        cx, cy = rect.center
+        pygame.draw.circle(screen, (17, 34, 52), (cx, cy), radius + 7, 2)
+        pygame.draw.circle(screen, (15, 27, 43), (cx, cy), radius)
+        pygame.draw.circle(screen, col if active else (93, 125, 149),
+                           (cx, cy), radius, 3)
+        pygame.draw.circle(screen, (210, 229, 242), (cx, cy), max(5, radius - 8), 1)
+        if active:
+            pygame.draw.circle(screen, col, (cx, cy), radius - 4, 2)
+        draw_text(screen, self.tiny_font, label, WHITE if active else (222, 234, 242),
+                  (cx, cy), shadow=False)
+
     def draw_touch_controls(self):
-        if self.state not in ("play", "countdown", "goal"):
+        if (not self.touch_controls_enabled
+                or self.state not in ("play", "countdown", "goal")):
             return
-        labels = {"up": "▲", "down": "▼", "left": "◀", "right": "▶",
-                  "dash": "DASH", "tackle": "TACKLE", "shoot": "SHOOT"}
+        self.draw_virtual_stick("p1")
+        if self.mode == "pvp":
+            self.draw_virtual_stick("p2")
+        labels = {"dash": "DASH", "tackle": "TACKLE", "shoot": "SHOOT"}
         for name, rect in self.touch_rects().items():
             side, action = name.split("_", 1)
-            col = BLUE if side == "p1" else RED
-            active = name in self.touch_held
-            layer = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
-            pygame.draw.rect(layer, (*col, 210 if active else 125), layer.get_rect(), border_radius=15)
-            pygame.draw.rect(layer, (255, 255, 255, 230 if active else 155),
-                             layer.get_rect(), 2, border_radius=15)
-            screen.blit(layer, rect.topleft)
-            font = self.font if action in ("up", "down", "left", "right") else self.tiny_font
-            draw_text(screen, font, labels[action], WHITE, rect.center, shadow=False)
-        draw_text(screen, self.tiny_font, "BLUE", BLUE_LIGHT, (100, H - 42), shadow=False)
-        if self.mode == "pvp":
-            draw_text(screen, self.tiny_font, "RED", RED_LIGHT, (W - 100, H - 42), shadow=False)
+            self.draw_action_button(name, rect, side, labels[action])
 
     def draw(self):
         if self.state == "menu":
@@ -5023,4 +5239,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
