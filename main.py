@@ -74,16 +74,265 @@ BOT_LEVELS = [
      "tackle": 0.100, "tk_range": 74, "fumble": 0.0003, "dash": True, "seek_pu": True},
 ]
 
+# Desktop builds start in fullscreen. Press F11 to switch between fullscreen and
+# windowed mode. Browsers require a user gesture for true fullscreen, so the web
+# build fills the viewport immediately and adds an HTML fullscreen toggle button.
+DISPLAY_FULLSCREEN = not WEB_BUILD
 if WEB_BUILD:
   screen = pygame.display.set_mode((W, H))
 else:
   try:
-    screen = pygame.display.set_mode((W, H), pygame.SCALED, vsync=1)
+    screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.FULLSCREEN, vsync=1)
   except Exception:
-    screen = pygame.display.set_mode((W, H))
+    try:
+      screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+    except Exception:
+      DISPLAY_FULLSCREEN = False
+      try:
+        screen = pygame.display.set_mode((W, H), pygame.SCALED, vsync=1)
+      except Exception:
+        screen = pygame.display.set_mode((W, H))
 
 pygame.display.set_caption("Hyper Soccer 1v1")
 clock = pygame.time.Clock()
+
+
+def set_desktop_fullscreen(enabled):
+    # Switch the native Pygame window between fullscreen and windowed modes.
+    global screen, DISPLAY_FULLSCREEN
+    if WEB_BUILD:
+        return False
+    flags = pygame.SCALED | (pygame.FULLSCREEN if enabled else 0)
+    try:
+        screen = pygame.display.set_mode((W, H), flags, vsync=1)
+    except TypeError:
+        screen = pygame.display.set_mode((W, H), flags)
+    except Exception:
+        try:
+            screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN if enabled else 0)
+        except Exception:
+            return False
+    DISPLAY_FULLSCREEN = bool(enabled)
+    return True
+
+
+def setup_web_fullscreen_ui():
+    # Make the web canvas fill the phone landscape viewport without letterboxing.
+    if not WEB_BUILD:
+        return
+    js = r'''    (function() {
+      try {
+        var root = document.documentElement;
+        var body = document.body;
+        var ua = navigator.userAgent || '';
+        var coarsePointer = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+        var phone = /Android.*Mobile|iPhone|iPod|Windows Phone/i.test(ua) ||
+                    (coarsePointer && Math.min(screen.width || 9999, screen.height || 9999) < 600);
+
+        var viewportMeta = document.querySelector('meta[name=viewport]');
+        if (!viewportMeta) {
+          viewportMeta = document.createElement('meta');
+          viewportMeta.name = 'viewport';
+          document.head.appendChild(viewportMeta);
+        }
+        viewportMeta.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+
+        [root, body].forEach(function(el) {
+          el.style.width = '100%';
+          el.style.height = '100%';
+          el.style.minHeight = '100dvh';
+          el.style.margin = '0';
+          el.style.padding = '0';
+          el.style.overflow = 'hidden';
+          el.style.position = 'fixed';
+          el.style.inset = '0';
+          el.style.background = '#050b17';
+          el.style.touchAction = 'none';
+        });
+
+        var canvas = document.querySelector('canvas');
+        function sizeCanvas() {
+          if (!canvas) canvas = document.querySelector('canvas');
+          if (!canvas) return;
+          /* Fill the real viewport. The landscape prompt prevents a phone from
+             squeezing the 12:7 pitch into a tall portrait screen. */
+          canvas.style.position = 'fixed';
+          canvas.style.left = '0';
+          canvas.style.top = '0';
+          canvas.style.right = '0';
+          canvas.style.bottom = '0';
+          canvas.style.width = '100vw';
+          canvas.style.height = '100dvh';
+          canvas.style.maxWidth = 'none';
+          canvas.style.maxHeight = 'none';
+          canvas.style.objectFit = 'fill';
+          canvas.style.display = 'block';
+          canvas.style.margin = '0';
+          canvas.style.padding = '0';
+          canvas.style.touchAction = 'none';
+          canvas.style.userSelect = 'none';
+          canvas.style.webkitUserSelect = 'none';
+        }
+        sizeCanvas();
+
+        var button = document.getElementById('hyper-soccer-fullscreen');
+        if (!button) {
+          button = document.createElement('button');
+          button.id = 'hyper-soccer-fullscreen';
+          button.type = 'button';
+          button.textContent = '⛶ FULLSCREEN';
+          button.setAttribute('aria-label', 'Toggle fullscreen');
+          button.style.position = 'fixed';
+          button.style.top = 'max(10px, env(safe-area-inset-top))';
+          button.style.right = 'max(10px, env(safe-area-inset-right))';
+          button.style.zIndex = '2147483647';
+          button.style.padding = '10px 14px';
+          button.style.border = '1px solid rgba(103,220,255,.85)';
+          button.style.borderRadius = '12px';
+          button.style.background = 'rgba(5,15,30,.82)';
+          button.style.color = '#dff8ff';
+          button.style.font = '700 12px system-ui, sans-serif';
+          button.style.letterSpacing = '.08em';
+          button.style.boxShadow = '0 4px 18px rgba(0,0,0,.35)';
+          button.style.backdropFilter = 'blur(8px)';
+          button.style.webkitBackdropFilter = 'blur(8px)';
+          button.style.cursor = 'pointer';
+          button.style.touchAction = 'manipulation';
+          button.style.userSelect = 'none';
+          document.body.appendChild(button);
+        }
+
+        var rotateOverlay = document.getElementById('hyper-soccer-rotate');
+        if (!rotateOverlay && phone) {
+          rotateOverlay = document.createElement('div');
+          rotateOverlay.id = 'hyper-soccer-rotate';
+          rotateOverlay.style.position = 'fixed';
+          rotateOverlay.style.inset = '0';
+          rotateOverlay.style.zIndex = '2147483646';
+          rotateOverlay.style.display = 'none';
+          rotateOverlay.style.flexDirection = 'column';
+          rotateOverlay.style.alignItems = 'center';
+          rotateOverlay.style.justifyContent = 'center';
+          rotateOverlay.style.gap = '18px';
+          rotateOverlay.style.padding = '28px';
+          rotateOverlay.style.boxSizing = 'border-box';
+          rotateOverlay.style.textAlign = 'center';
+          rotateOverlay.style.background = 'radial-gradient(circle at 50% 35%, #15334d, #050b17 72%)';
+          rotateOverlay.style.color = '#eef9ff';
+          rotateOverlay.style.fontFamily = 'system-ui, sans-serif';
+          rotateOverlay.style.touchAction = 'manipulation';
+
+          var rotateIcon = document.createElement('div');
+          rotateIcon.textContent = '↻';
+          rotateIcon.style.fontSize = '76px';
+          rotateIcon.style.lineHeight = '1';
+          rotateIcon.style.color = '#68dcff';
+          rotateIcon.style.textShadow = '0 0 28px rgba(70,210,255,.55)';
+          rotateOverlay.appendChild(rotateIcon);
+
+          var heading = document.createElement('div');
+          heading.textContent = 'ROTATE YOUR PHONE';
+          heading.style.fontSize = 'clamp(22px, 6vw, 32px)';
+          heading.style.fontWeight = '900';
+          heading.style.letterSpacing = '.08em';
+          rotateOverlay.appendChild(heading);
+
+          var hint = document.createElement('div');
+          hint.textContent = 'Hyper Soccer plays in landscape so the pitch and controls fit your screen.';
+          hint.style.maxWidth = '320px';
+          hint.style.fontSize = '15px';
+          hint.style.lineHeight = '1.5';
+          hint.style.color = '#b7cada';
+          rotateOverlay.appendChild(hint);
+
+          var rotateButton = document.createElement('button');
+          rotateButton.type = 'button';
+          rotateButton.textContent = '⛶  TRY LANDSCAPE FULLSCREEN';
+          rotateButton.style.marginTop = '8px';
+          rotateButton.style.padding = '14px 20px';
+          rotateButton.style.border = '1px solid #68dcff';
+          rotateButton.style.borderRadius = '14px';
+          rotateButton.style.background = 'linear-gradient(135deg, #164b70, #12243d)';
+          rotateButton.style.color = '#f0fbff';
+          rotateButton.style.font = '800 13px system-ui, sans-serif';
+          rotateButton.style.letterSpacing = '.04em';
+          rotateButton.style.boxShadow = '0 8px 28px rgba(0,0,0,.35)';
+          rotateButton.style.touchAction = 'manipulation';
+          rotateOverlay.appendChild(rotateButton);
+          document.body.appendChild(rotateOverlay);
+        }
+
+        function isFullscreen() {
+          return !!(document.fullscreenElement || document.webkitFullscreenElement);
+        }
+
+        async function enterOrExitFullscreen() {
+          try {
+            if (isFullscreen()) {
+              if (document.exitFullscreen) await document.exitFullscreen();
+              else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+              if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+            } else {
+              var target = document.documentElement;
+              if (target.requestFullscreen) await target.requestFullscreen({navigationUI: 'hide'});
+              else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+              /* Android Chrome supports locking orientation after fullscreen begins. */
+              if (phone && screen.orientation && screen.orientation.lock) {
+                try { await screen.orientation.lock('landscape'); } catch (orientationError) {}
+              }
+            }
+          } catch (err) {
+            /* Some mobile browsers only support manual device rotation. */
+          }
+          updateViewport();
+          updateButton();
+        }
+
+        button.onclick = enterOrExitFullscreen;
+        if (rotateOverlay) {
+          var rotateButton = rotateOverlay.querySelector('button');
+          if (rotateButton) rotateButton.onclick = enterOrExitFullscreen;
+        }
+
+        function updateViewport() {
+          sizeCanvas();
+          var portrait = window.innerHeight > window.innerWidth;
+          if (rotateOverlay) rotateOverlay.style.display = portrait ? 'flex' : 'none';
+          if (button) button.style.display = (phone && portrait) ? 'none' : 'block';
+        }
+
+        function updateButton() {
+          if (button) button.textContent = isFullscreen() ? '✕ EXIT FULLSCREEN' : '⛶ FULLSCREEN';
+          updateViewport();
+        }
+
+        window.addEventListener('resize', updateViewport, {passive: true});
+        window.addEventListener('orientationchange', updateViewport, {passive: true});
+        if (window.visualViewport) {
+          window.visualViewport.addEventListener('resize', updateViewport, {passive: true});
+        }
+        if (screen.orientation && screen.orientation.addEventListener) {
+          screen.orientation.addEventListener('change', updateViewport);
+        }
+        document.addEventListener('fullscreenchange', updateButton);
+        document.addEventListener('webkitfullscreenchange', updateButton);
+        window.addEventListener('keydown', function(event) {
+          if (event.key === 'F11' && !phone) {
+            event.preventDefault();
+            enterOrExitFullscreen();
+          }
+        });
+        updateViewport();
+        updateButton();
+      } catch (err) { /* Keep the game playable if a browser blocks page styling. */ }
+    })();
+    '''
+    try:
+        platform.window.eval(js)
+    except Exception:
+        pass
+
+setup_web_fullscreen_ui()
 
 # ============================================================
 # COLORS
@@ -2631,6 +2880,13 @@ class Game:
                 self.sound.toggle_music()
                 continue
 
+            # F11 toggles native desktop fullscreen. On the web, the HTML overlay
+            # button handles the browser's user-gesture requirement.
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                if not WEB_BUILD:
+                    set_desktop_fullscreen(not DISPLAY_FULLSCREEN)
+                continue
+
             st = self.state
             # SDL may deliver touch events without synthesizing mouse clicks on mobile.
             # Convert menu taps to clicks; gameplay keeps native finger events for multitouch.
@@ -4076,7 +4332,7 @@ class Game:
 
         music_label = "MUSIC ON [B]" if self.sound.music_enabled else "MUSIC OFF [B]"
         draw_text(screen, self.small_font,
-                  f"UP / DOWN SELECT   ENTER PLAY   C CUSTOMIZE   U UPGRADES   O SETTINGS   {music_label}",
+                  f"UP / DOWN SELECT   ENTER PLAY   C CUSTOMIZE   U UPGRADES   O SETTINGS   {music_label}   F11 FULLSCREEN",
                   WHITE, (W // 2, H - 24))
         if WEB_BUILD and self.net_msg:
             draw_text(screen, self.small_font, self.net_msg, GOLD, (W // 2, H - 54))
@@ -5239,3 +5495,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
