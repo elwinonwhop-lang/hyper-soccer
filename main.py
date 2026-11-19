@@ -9,10 +9,14 @@ import time
 from array import array
 
 WEB_BUILD = sys.platform == "emscripten"
+RELAY_URL = "wss://hyper-soccer-relay-1.onrender.com"
 
-if not WEB_BUILD:
+if WEB_BUILD:
+  import platform
+else:
   import socket
   import threading
+
 
 if int(pygame.version.ver.split(".")[0]) < 2:
     print("Hyper Soccer needs pygame 2 or newer.  Install it with:  pip install --upgrade pygame")
@@ -695,6 +699,84 @@ class Net:
             if isinstance(msg, dict) and msg.get("g") == MAGIC:
                 out.append((msg, addr))
         return out
+
+class WebNet:
+  """Browser WebSocket adapter that routes packets through your Render relay."""
+
+  def __init__(self):
+    self.ws = None
+    self.role = None
+    self.inbox = []
+    self.ready = False
+    self.room_code = ""
+    self.err = ""
+
+  def open(self, role):
+    self.close()
+    self.role = role
+    self.inbox.clear()
+    self.ready = False
+    self.room_code = ""
+    self.err = ""
+    ws = platform.window.WebSocket.new(RELAY_URL)
+
+    def on_open(evt):
+      self.ready = True
+      if role == "host":
+        ws.send(json.dumps({"relay": "create"}))
+
+    def on_msg(evt):
+      try:
+        msg = json.loads(str(evt.data))
+        if msg.get("relay") == "created":
+          self.room_code = msg.get("code", "")
+        elif msg.get("relay") == "error":
+          self.err = msg.get("msg", "Room not found or full")
+        elif msg.get("g") == MAGIC:
+          self.inbox.append((msg, ("relay", 0)))
+      except Exception:
+        pass
+
+    def on_err(evt):
+      self.err = "Could not connect to relay server (waking up? Try again)"
+
+    ws.onopen = on_open
+    ws.onmessage = on_msg
+    ws.onerror = on_err
+    self.ws = ws
+
+  def close(self):
+    if self.ws:
+      try:
+        self.ws.close()
+      except Exception:
+        pass
+    self.ws = None
+    self.role = None
+    self.ready = False
+
+  def send(self, msg, addr=None):
+    if not self.ws or not self.ready:
+      return
+    msg["g"] = MAGIC
+    msg["v"] = PROTO
+    try:
+      self.ws.send(json.dumps(msg, separators=(",", ":")))
+    except Exception:
+      pass
+
+  def join_room(self, code):
+    if self.ws and self.ready:
+      self.ws.send(json.dumps({"relay": "join", "code": code.upper().strip()}))
+
+  def broadcast(self, msg):
+    pass
+
+  def poll(self):
+    out = list(self.inbox)
+    self.inbox.clear()
+    return out
+
 
 
 def r1(v):
@@ -1418,7 +1500,7 @@ class Game:
 
         # ---- online state ----
         self.name = f"Player{random.randint(10, 99)}"
-        self.net = Net()
+        self.net = WebNet() if WEB_BUILD else Net()
         self.net_msg = ""
         self.online_sel = 1
         self.join_text = ""
@@ -2425,6 +2507,7 @@ class Game:
         elif i == 1:
             self.start_match("bot")
         elif i == 2:
+            self.open_online_menu()
             if WEB_BUILD:
                 self.net_msg = "Online party mode is not available in the browser build. Try 1 V 1 or 1 V BOT."
             else:
@@ -3705,13 +3788,17 @@ class Game:
         draw_text(screen, self.small_font, "LOCAL SOCCER  -  CHOOSE YOUR GAME MODE",
                   (220, 235, 220), (W // 2, 160))
 
-        options = [("1 V 1", "Play against another player on this device"),
-                   ("1 V BOT", "Play against the computer"),
-                   (("ONLINE (DESKTOP ONLY)" if WEB_BUILD else "ONLINE PARTY"),
-                    ("Not available in the browser version" if WEB_BUILD else "Create or join a party over the network")),
-                   ("PENALTY SHOOTOUTS", "Pick your shot. Can you beat the keeper?")]
+        options = [
+            ("1 V 1", "Play against another player on this device"),
+            ("1 V BOT", "Play against the computer"),
+            ("ONLINE PARTY", "Create or join a party over the internet"),
+            ("PENALTY SHOOTOUTS", "Pick your shot. Can you beat the keeper?"),
+        ]
         for i, (name, description) in enumerate(options):
-            self.draw_button(self.menu_rects[i], self.menu_selection == i, name, description)
+          self.draw_button(
+              self.menu_rects[i], self.menu_selection == i, name, description
+          )
+
 
         cr = self.customize_rect
         chov = cr.collidepoint(pygame.mouse.get_pos())
