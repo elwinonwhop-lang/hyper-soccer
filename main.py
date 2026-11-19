@@ -701,15 +701,15 @@ class Net:
         return out
 
 class WebNet:
-  """Browser WebSocket adapter that routes packets through your Render relay."""
+  """Browser WebSocket adapter using a safe JS queue so Pygbag never freezes."""
 
   def __init__(self):
-    self.ws = None
     self.role = None
     self.inbox = []
     self.ready = False
     self.room_code = ""
     self.err = ""
+    self.active = False
 
   def open(self, role):
     self.close()
@@ -718,61 +718,103 @@ class WebNet:
     self.ready = False
     self.room_code = ""
     self.err = ""
-    ws = platform.window.WebSocket.new(RELAY_URL)
+    self.active = True
 
-    def on_open(evt):
-      self.ready = True
-      if role == "host":
-        ws.send(json.dumps({"relay": "create"}))
+    js_setup = f"""
+        (function() {{
+            if (window._hs_ws) {{
+                try {{ window._hs_ws.close(); }} catch(e) {{}}
+            }}
+            window._hs_q = [];
+            window._hs_ready = false;
+            window._hs_err = "";
+            var ws = new WebSocket({json.dumps(RELAY_URL)});
+            window._hs_ws = ws;
+            ws.onopen = function() {{
+                window._hs_ready = true;
+                if ({json.dumps(role)} === "host") {{
+                    ws.send(JSON.stringify({{"relay": "create"}}));
+                }}
+            }};
+            ws.onmessage = function(evt) {{
+                window._hs_q.push(String(evt.data));
+            }};
+            ws.onerror = function() {{
+                window._hs_err = "Could not connect to relay server (waking up? Try again)";
+            }};
+            ws.onclose = function() {{
+                window._hs_ready = false;
+            }};
+        }})();
+        """
+    platform.window.eval(js_setup)
 
-    def on_msg(evt):
+  def close(self):
+    if self.active:
       try:
-        msg = json.loads(str(evt.data))
+        platform.window.eval(
+            "if (window._hs_ws) { try { window._hs_ws.close(); } catch(e) {}"
+            " window._hs_ws = null; }"
+        )
+      except Exception:
+        pass
+    self.active = False
+    self.role = None
+    self.ready = False
+
+  def _send_raw(self, text):
+    if not self.active:
+      return
+    try:
+      platform.window.eval(
+          "if (window._hs_ws && window._hs_ws.readyState === 1) {"
+          f" window._hs_ws.send({json.dumps(text)}); }}"
+      )
+    except Exception:
+      pass
+
+  def send(self, msg, addr=None):
+    if not self.active or not self.ready:
+      return
+    msg["g"] = MAGIC
+    msg["v"] = PROTO
+    self._send_raw(json.dumps(msg, separators=(",", ":")))
+
+  def join_room(self, code):
+    if self.active and self.ready:
+      self._send_raw(
+          json.dumps({"relay": "join", "code": code.upper().strip()})
+      )
+
+  def broadcast(self, msg):
+    pass
+
+  def poll(self):
+    if not self.active:
+      return []
+    try:
+      self.ready = bool(platform.window.eval("Boolean(window._hs_ready)"))
+      err = str(platform.window.eval("String(window._hs_err || '')"))
+      if err:
+        self.err = err
+        platform.window.eval("window._hs_err = '';")
+      raw_list = str(
+          platform.window.eval(
+              "(function(){ var q = window._hs_q || []; window._hs_q = [];"
+              " return JSON.stringify(q); })()"
+          )
+      )
+      items = json.loads(raw_list)
+      for raw in items:
+        msg = json.loads(raw)
         if msg.get("relay") == "created":
           self.room_code = msg.get("code", "")
         elif msg.get("relay") == "error":
           self.err = msg.get("msg", "Room not found or full")
         elif msg.get("g") == MAGIC:
           self.inbox.append((msg, ("relay", 0)))
-      except Exception:
-        pass
-
-    def on_err(evt):
-      self.err = "Could not connect to relay server (waking up? Try again)"
-
-    ws.onopen = on_open
-    ws.onmessage = on_msg
-    ws.onerror = on_err
-    self.ws = ws
-
-  def close(self):
-    if self.ws:
-      try:
-        self.ws.close()
-      except Exception:
-        pass
-    self.ws = None
-    self.role = None
-    self.ready = False
-
-  def send(self, msg, addr=None):
-    if not self.ws or not self.ready:
-      return
-    msg["g"] = MAGIC
-    msg["v"] = PROTO
-    try:
-      self.ws.send(json.dumps(msg, separators=(",", ":")))
     except Exception:
       pass
-
-  def join_room(self, code):
-    if self.ws and self.ready:
-      self.ws.send(json.dumps({"relay": "join", "code": code.upper().strip()}))
-
-  def broadcast(self, msg):
-    pass
-
-  def poll(self):
     out = list(self.inbox)
     self.inbox.clear()
     return out
@@ -2236,9 +2278,19 @@ class Game:
               elif now - j["last"] > 0.4:
                 j["last"] = now
                 net.send({"t": "join", "name": self.name}, j["addr"])
-
+        elif self.mode == "client":
+          if now - self.host_last > 6.0:
+            self.leave_party("Lost connection to the host")
+            return
+          if self.state == "lobby":
+            if now - self.lobby_send_t > 0.25:
+              self.lobby_send_t = now
+              net.send({"t": "cl", "r": int(self.my_ready)}, self.host_addr)
+          elif self.state in GAME_STATES:
+            self.client_send_input(now)
 
     def client_send_input(self, now):
+
         if now - self.in_send_t < 1.0 / 65.0:
             return
         self.in_send_t = now
