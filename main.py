@@ -1922,7 +1922,7 @@ class Game:
         self.guest_ready = False
         self.lobby_names = [self.name, ""]
         self.lobby_ready = [True, False]
-        self.party_code = encode_code(local_ip())
+        self.party_code = "..." if WEB_BUILD else encode_code(local_ip())
         self.public_code = None
         self.public_state = ""
         self.net_msg = ""
@@ -1952,19 +1952,29 @@ class Game:
         self.net_msg = "Connecting..."
 
     def join_submit(self):
-        text = self.join_text.strip()
-        if text:
-            target = parse_target(text)
-            if target is None:
-                self.net_msg = "That doesn't look like a party code or IP address."
-                return
-            self.try_join(target)
+      text = self.join_text.strip()
+      if WEB_BUILD:
+        if len(text) < 4:
+          self.net_msg = "Type the 5-letter room code from your friend."
+          return
+        self.try_join(("relay", 0))
+        return
+      if text:
+        target = parse_target(text)
+        if target is None:
+          self.net_msg = "That doesn't look like a party code or IP address."
+          return
+        self.try_join(target)
+      else:
+        lst = self.lan_list()
+        if lst:
+          self.try_join(lst[clamp(self.join_sel, 0, len(lst) - 1)])
         else:
-            lst = self.lan_list()
-            if lst:
-                self.try_join(lst[clamp(self.join_sel, 0, len(lst) - 1)][0])
-            else:
-                self.net_msg = "Type a party code or IP address, or wait for a party to appear."
+          self.net_msg = (
+              "Type a party code or IP address, or wait for a party to appear."
+          )
+
+
 
     def lan_list(self):
         return sorted(self.lan_found.items(), key=lambda kv: (kv[1]["name"], kv[0]))[:4]
@@ -2082,6 +2092,12 @@ class Game:
 
     def host_pump(self, msgs, now):
         net = self.net
+        if WEB_BUILD:
+          if net.room_code:
+            self.party_code = net.room_code
+          if net.err:
+            self.net_msg = net.err
+        
         for msg, addr in msgs:
             try:
                 t = msg.get("t")
@@ -2185,31 +2201,42 @@ class Game:
                 continue
 
         if self.state == "join":
-            if now - self.find_t > 1.0:
-                self.find_t = now
-                net.broadcast({"t": "find"})
-            for a in list(self.lan_found):
-                if now - self.lan_found[a]["seen"] > 3.5:
-                    del self.lan_found[a]
+          if WEB_BUILD:
+            if net.err:
+              self.joining = None
+              self.net_msg = net.err
+              net.err = ""
             if self.joining:
-                j = self.joining
-                if now - j["start"] > 6.0:
-                    self.joining = None
-                    self.net_msg = ("No answer from the host. Check the code/IP, the host's firewall "
-                                    f"and (over the internet) UDP port {NET_PORT} forwarding.")
-                elif now - j["last"] > 0.4:
-                    j["last"] = now
-                    net.send({"t": "join", "name": self.name}, j["addr"])
-        elif self.mode == "client":
-            if now - self.host_last > 6.0:
-                self.leave_party("Lost connection to the host")
-                return
-            if self.state == "lobby":
-                if now - self.lobby_send_t > 0.25:
-                    self.lobby_send_t = now
-                    net.send({"t": "cl", "r": int(self.my_ready)}, self.host_addr)
-            elif self.state in GAME_STATES:
-                self.client_send_input(now)
+              j = self.joining
+              if now - j["start"] > 25.0:
+                self.joining = None
+                self.net_msg = (
+                    "Timed out. Check the 5-letter room code and try again."
+                )
+              elif net.ready and now - j["last"] > 0.6:
+                j["last"] = now
+                net.join_room(self.join_text)
+                net.send({"t": "join", "name": self.name}, ("relay", 0))
+          else:
+            if now - self.find_t > 1.0:
+              self.find_t = now
+              net.broadcast({"t": "find"})
+            for a in list(self.lan_found):
+              if now - self.lan_found[a]["seen"] > 3.5:
+                del self.lan_found[a]
+            if self.joining:
+              j = self.joining
+              if now - j["start"] > 6.0:
+                self.joining = None
+                self.net_msg = (
+                    "No answer from the host. Check the code/IP, the host's"
+                    f" firewall and (over the internet) UDP port {NET_PORT}"
+                    " forwarding."
+                )
+              elif now - j["last"] > 0.4:
+                j["last"] = now
+                net.send({"t": "join", "name": self.name}, j["addr"])
+
 
     def client_send_input(self, now):
         if now - self.in_send_t < 1.0 / 65.0:
