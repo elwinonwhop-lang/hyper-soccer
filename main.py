@@ -2875,10 +2875,18 @@ class Game:
                 self.running = False
                 return
 
-            # B toggles background music from every screen without changing gameplay controls.
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
-                self.sound.toggle_music()
-                continue
+            # B toggles background music except when typing a room code or player name.
+            typing = self.state == "join" or (
+                self.state == "online_menu" and self.online_sel == 0
+            )
+            if (
+                event.type == pygame.KEYDOWN
+                and event.key == pygame.K_b
+                and not typing
+            ):
+              self.sound.toggle_music()
+              continue
+
 
             # F11 toggles native desktop fullscreen. On the web, the HTML overlay
             # button handles the browser's user-gesture requirement.
@@ -3084,31 +3092,41 @@ class Game:
         return pygame.Rect(W // 2 - 290, 190 + i * 54, 580, 48)
 
     def events_join(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for i, (addr, _) in enumerate(self.lan_list()):
-                if self.join_row_rect(i).collidepoint(event.pos):
-                    self.join_sel = i
-                    self.join_text = ""
-                    self.try_join(addr)
-        elif event.type == pygame.KEYDOWN:
-            k = event.key
-            if k == pygame.K_ESCAPE:
-                self.net.close()
-                self.joining = None
-                self.state = "online_menu"
-                self.net_msg = ""
-            elif k == pygame.K_UP:
-                self.join_sel = max(0, self.join_sel - 1)
-            elif k == pygame.K_DOWN:
-                self.join_sel = min(max(0, len(self.lan_list()) - 1), self.join_sel + 1)
-            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.join_submit()
-            elif k == pygame.K_BACKSPACE:
-                self.join_text = self.join_text[:-1]
-            elif k == pygame.K_v and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-                self.join_text = (self.join_text + clipboard_text().strip())[:30]
-            elif event.unicode and event.unicode.isprintable() and len(self.join_text) < 30:
-                self.join_text += event.unicode
+      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        for i, (addr, _) in enumerate(self.lan_list()):
+          if self.join_row_rect(i).collidepoint(event.pos):
+            self.join_sel = i
+            self.join_text = ""
+            self.try_join(addr)
+      elif event.type == pygame.KEYDOWN:
+        k = event.key
+        if k == pygame.K_ESCAPE:
+          self.net.close()
+          self.joining = None
+          self.state = "online_menu"
+          self.net_msg = ""
+        elif k == pygame.K_UP:
+          self.join_sel = max(0, self.join_sel - 1)
+        elif k == pygame.K_DOWN:
+          self.join_sel = min(
+              max(0, len(self.lan_list()) - 1), self.join_sel + 1
+          )
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+          self.join_submit()
+        elif k == pygame.K_BACKSPACE:
+          self.join_text = self.join_text[:-1]
+        elif k == pygame.K_v and (
+            event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
+        ):
+          self.join_text = (self.join_text + clipboard_text().strip())[:30]
+        elif len(self.join_text) < 30:
+          ch = event.unicode if len(event.unicode) == 1 else ""
+          if not ch:
+            name = pygame.key.name(k)
+            if len(name) == 1 and name.isalnum():
+              ch = name.upper() if (event.mod & pygame.KMOD_SHIFT) else name
+          if ch and ch.isprintable():
+            self.join_text += ch
 
     def events_lobby(self, event):
         if event.type != pygame.KEYDOWN:
