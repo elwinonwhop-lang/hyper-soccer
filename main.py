@@ -2130,6 +2130,12 @@ class Game:
             return False
 
     def joystick_center(self, side):
+        """Place single-player and online mobile controls together on the right.
+
+        Local 2-player mode keeps one controller on each side of the screen.
+        """
+        if side == "p1" and self.mode in ("bot", "host", "client"):
+            return (W - 100, H - 142)
         return (96, H - 142) if side == "p1" else (W - 96, H - 142)
 
     def update_joystick(self, side, pos):
@@ -4136,11 +4142,14 @@ class Game:
                 "p2_skill": circle(W - 335, H - 65, 34),
             }
         else:
+            # One-human modes (1vBot and online 1v1): keep the entire mobile
+            # controller on the right.  The joystick sits at the outer edge,
+            # while the action buttons form two neat columns to its left.
             rects = {
-                "p1_dash": circle(W - 225, H - 220, 37),
-                "p1_tackle": circle(W - 225, H - 125, 37),
-                "p1_shoot": circle(W - 112, H - 170, 51),
-                "p1_skill": circle(W - 112, H - 65, 34),
+                "p1_dash": circle(W - 390, H - 220, 37),
+                "p1_tackle": circle(W - 390, H - 125, 37),
+                "p1_shoot": circle(W - 260, H - 170, 51),
+                "p1_skill": circle(W - 260, H - 65, 34),
             }
         return rects
 
