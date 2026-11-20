@@ -59,7 +59,7 @@ MATCH_SECONDS = 90
 
 # Online settings
 NET_PORT = 47821     # UDP port the host listens on
-PROTO = 2            # bump when the network protocol changes
+PROTO = 5            # hybrid 2v2 plus authoritative sliding-keeper snapshots
 MAGIC = "HSOC"
 INTERP_DELAY = 0.105  # seconds behind the host; gives WebSocket jitter room to settle
 
@@ -79,15 +79,16 @@ PU_COLORS = ((255, 225, 60), (255, 130, 40), (120, 215, 255))
 PU_DUR = (480.0, 600.0, 100.0)           # effect length in 60 Hz frames
 
 BOT_LEVELS = [
-    {"name": "EASY", "lull": 0.0050, "lull_len": (25, 60), "think": (16, 34), "mag": 0.60,
-     "err": 55, "aim": 110, "shoot": 0.009, "shoot_x": 560, "charge": (0.0, 0.30),
-     "tackle": 0.018, "tk_range": 60, "fumble": 0.0025, "dash": False, "seek_pu": False},
-    {"name": "NORMAL", "lull": 0.0035, "lull_len": (18, 45), "think": (12, 26), "mag": 0.74,
-     "err": 40, "aim": 100, "shoot": 0.013, "shoot_x": 600, "charge": (0.0, 0.45),
-     "tackle": 0.030, "tk_range": 66, "fumble": 0.0012, "dash": False, "seek_pu": False},
-    {"name": "HARD", "lull": 0.0, "lull_len": (1, 2), "think": (5, 11), "mag": 1.0,
-     "err": 16, "aim": 85, "shoot": 0.045, "shoot_x": 760, "charge": (0.25, 0.85),
-     "tackle": 0.100, "tk_range": 74, "fumble": 0.0003, "dash": True, "seek_pu": True},
+    # The default computer should be beatable: it hesitates, aims loosely, and rarely tackles.
+    {"name": "EASY", "lull": 0.0070, "lull_len": (22, 46), "think": (27, 45), "mag": 0.43,
+     "err": 82, "aim": 155, "shoot": 0.0045, "shoot_x": 455, "charge": (0.0, 0.16),
+     "tackle": 0.010, "tk_range": 52, "fumble": 0.0038, "dash": False, "seek_pu": False},
+    {"name": "NORMAL", "lull": 0.0045, "lull_len": (18, 38), "think": (20, 34), "mag": 0.57,
+     "err": 63, "aim": 132, "shoot": 0.008, "shoot_x": 530, "charge": (0.0, 0.28),
+     "tackle": 0.020, "tk_range": 59, "fumble": 0.0022, "dash": False, "seek_pu": False},
+    {"name": "HARD", "lull": 0.0010, "lull_len": (8, 18), "think": (13, 23), "mag": 0.76,
+     "err": 42, "aim": 108, "shoot": 0.019, "shoot_x": 660, "charge": (0.05, 0.48),
+     "tackle": 0.052, "tk_range": 68, "fumble": 0.0012, "dash": False, "seek_pu": False},
 ]
 
 # Desktop builds start in fullscreen. Press F11 to switch between fullscreen and
@@ -1122,7 +1123,10 @@ def pack_player(p):
     return [r2(p.x), r2(p.y), r2(p.vx), r2(p.vy), r2(p.facing_x), r2(p.facing_y),
             int(p.stamina), int(p.charging), r2(p.charge), r1(p.kick_timer),
             r1(p.tackle_timer), r2(p.squash), r1(p.flash_timer), int(p.exhausted),
-            int(p.boost_t), int(p.mega_t), int(p.frozen_t)]
+            int(p.boost_t), int(p.mega_t), int(p.frozen_t),
+            int(getattr(p, "special_armed", False)),
+            int(getattr(p, "special_kind", "curve") == "chip"),
+            r1(getattr(p, "special_cooldown", 0.0))]
 
 
 # ============================================================
@@ -1216,6 +1220,11 @@ class Player:
         self.shot_charge = 0.0
         self.shot_buffer = 0.0
         self.tackle_buffer = 0.0
+        # Two alternating signature moves: a bending CURVE shot and a lifted CHIP.
+        self.special_armed = False
+        self.special_kind = "curve"
+        self.special_cooldown = 0.0
+        self.shot_special = None
 
         self.facing_x = -1.0 if is_p2 else 1.0
         self.facing_y = 0.0
@@ -1250,6 +1259,7 @@ class Player:
         self.boost_t = max(0.0, self.boost_t - dt)
         self.mega_t = max(0.0, self.mega_t - dt)
         self.frozen_t = max(0.0, self.frozen_t - dt)
+        self.special_cooldown = max(0.0, self.special_cooldown - dt)
         self.squash *= 0.86 ** dt
         if self.charging:
             self.charge = min(1.0, self.charge + dt / 38.0)
@@ -1529,6 +1539,10 @@ class SoccerBall:
         self.post_hit = False
         self.last_shot_origin = None
         self.last_shot_side = None
+        self.curve = 0.0
+        self.curve_t = 0.0
+        self.lift = 0.0
+        self.lift_v = 0.0
 
     def give_to(self, player):
         if self.owner and self.owner is not player:
@@ -1572,8 +1586,25 @@ class SoccerBall:
         if self.owner:
             self.dribble_with(self.owner, dt)
             self.rotation += math.hypot(self.owner.vx, self.owner.vy) * 0.1 * dt
+            self.curve = self.curve_t = self.lift = self.lift_v = 0.0
             self.trail.clear()
             return
+
+        # Signature-shot physics. Curve gently bends the flight; chip adds a
+        # short arc that visually clears a keeper without changing pitch geometry.
+        speed_for_curve = math.hypot(self.vx, self.vy)
+        if self.curve_t > 0.0 and speed_for_curve > 2.5:
+            nx, ny = -self.vy / speed_for_curve, self.vx / speed_for_curve
+            bend = self.curve * 0.075 * dt
+            self.vx += nx * bend
+            self.vy += ny * bend
+            self.curve_t = max(0.0, self.curve_t - dt)
+            self.curve *= 0.986 ** dt
+        if self.lift > 0.0 or self.lift_v > 0.0:
+            self.lift = max(0.0, self.lift + self.lift_v * dt)
+            self.lift_v -= 0.20 * dt
+            if self.lift <= 0.0:
+                self.lift_v = 0.0
 
         self.x += self.vx * dt
         self.y += self.vy * dt
@@ -1637,8 +1668,8 @@ class SoccerBall:
         elif self.trail:
             self.trail.pop(0)
 
-    def shoot(self, player, particles, charge=0.0):
-        """Returns True if a kick actually happened."""
+    def shoot(self, player, particles, charge=0.0, special=None):
+        """Returns True if a kick actually happened; special may be curve or chip."""
         speed_p = math.hypot(player.vx, player.vy)
         if self.owner is player:
             self.last_shot_origin = (float(player.x), float(player.y))
@@ -1681,6 +1712,19 @@ class SoccerBall:
             self.vx = nx * power + player.vx * 0.18
             self.vy = ny * power + player.vy * 0.18
 
+        # Clear any previous shot effect before applying the selected move.
+        self.curve = 0.0
+        self.curve_t = 0.0
+        self.lift = 0.0
+        self.lift_v = 0.0
+        if special == "curve":
+            # The curve direction follows facing and player side for readable arcs.
+            turn = -1.0 if player.is_p2 else 1.0
+            self.curve = clamp((-player.facing_y * 0.75 + turn * 0.45), -1.0, 1.0) * 2.2
+            self.curve_t = 42.0
+        elif special == "chip":
+            self.lift_v = 3.8
+
         sp = math.hypot(self.vx, self.vy)
         cap = self.MAX_SPEED * (1.0 + int(getattr(player, "shooting_level", 0)) * 0.07) * (1.3 if player.mega_t > 0 else 1.0)
         if sp > cap:
@@ -1706,10 +1750,15 @@ class SoccerBall:
         dist = math.hypot(dx, dy)
 
         tackle_range = 80 + int(getattr(player, "defending_level", 0)) * 7
-        if player.tackle_timer > 0 and self.owner and self.owner is not player and dist < tackle_range:
+        if (player.tackle_timer > 0 and self.owner and self.owner is not player
+                and self.owner.is_p2 != player.is_p2 and dist < tackle_range):
             self.give_to(player)
             self.possession_lock = 10.0
             return "steal"
+
+        # Teammates can support and receive passes without stealing possession.
+        if self.owner and self.owner.is_p2 == player.is_p2:
+            return None
 
         # Defending: simply touching the ball off the opponent wins possession.
         if self.owner:
@@ -1741,7 +1790,117 @@ class SoccerBall:
         return None
 
     def draw(self, surface):
-        draw_ball(surface, self.x, self.y, self.radius, self.rotation)
+        draw_ball(surface, self.x, self.y - self.lift, self.radius, self.rotation,
+                  ground_y=self.y)
+
+
+class Goalkeeper:
+    """A sliding goal-line bar. The host simulates saves; clients interpolate its state."""
+    def __init__(self, side):
+        self.side = int(side)  # 1 protects the left/blue goal; 2 protects right/red.
+        self.x = FIELD_LEFT + 8 if self.side == 1 else FIELD_RIGHT - 8
+        self.y = float(FIELD_CY)
+        self.vy = 0.0
+        self.target_y = float(FIELD_CY)
+        self.reaction_timer = random.uniform(7.0, 13.0)
+        self.dive_timer = 0.0
+        self.dive_dir = 0.0
+        self.save_flash = 0.0
+        self.animation = random.random() * 8.0
+        self.color = BLUE if self.side == 1 else RED
+        self.light = BLUE_LIGHT if self.side == 1 else RED_LIGHT
+        self.bar_half = 36.0
+
+    def update(self, ball, dt):
+        dt = max(0.0, float(dt))
+        self.animation += (0.10 + abs(self.vy) * 0.018) * dt
+        self.dive_timer = max(0.0, self.dive_timer - dt)
+        self.save_flash = max(0.0, self.save_flash - dt)
+        self.reaction_timer -= dt
+
+        incoming = ball.vx < -0.8 if self.side == 1 else ball.vx > 0.8
+        distance_x = abs(ball.x - self.x)
+
+        # Reassess the shot every few frames. The line deliberately reacts late and
+        # predicts only a little so that ordinary players can still score.
+        if self.reaction_timer <= 0.0:
+            self.reaction_timer = random.uniform(7.0, 13.0)
+            if incoming and distance_x < 560:
+                lead = min(1.15, distance_x / max(80.0, abs(ball.vx)) * 0.16)
+                self.target_y = ball.y + ball.vy * lead + random.uniform(-8.0, 8.0)
+            elif distance_x < 180:
+                self.target_y = lerp(FIELD_CY, ball.y, 0.18)
+            else:
+                self.target_y = lerp(self.target_y, FIELD_CY, 0.24)
+            self.target_y = clamp(self.target_y, GOAL_TOP + self.bar_half,
+                                  GOAL_BOTTOM - self.bar_half)
+
+        error = self.target_y - self.y
+        # A clear speed limit keeps the keeper from snapping perfectly to every shot.
+        desired_vy = clamp(error * 0.075, -2.65, 2.65)
+        self.vy = lerp(self.vy, desired_vy, ease(0.17, dt))
+        self.y += self.vy * dt
+        self.y = clamp(self.y, GOAL_TOP + self.bar_half, GOAL_BOTTOM - self.bar_half)
+
+        if (incoming and distance_x < 145 and abs(ball.y - self.y) < 45
+                and self.dive_timer <= 0.0 and random.random() < 0.10 * dt):
+            self.dive_dir = -1.0 if ball.y < self.y else 1.0
+            self.dive_timer = 8.0
+
+    def try_save(self, ball):
+        incoming = ball.vx < -0.2 if self.side == 1 else ball.vx > 0.2
+        if ball.owner is not None or ball.lift > 30.0 or not incoming:
+            return False
+
+        dx = ball.x - self.x
+        dy = ball.y - self.y
+        # The keeper is a vertical segment on the goal line, not a full-sized player.
+        half_length = self.bar_half + (8.0 if self.dive_timer > 0.0 else 0.0)
+        if abs(dx) > 18.0 + ball.radius * 0.45:
+            return False
+        if abs(dy) > half_length + ball.radius * 0.45:
+            return False
+
+        # Deflect the shot back into play; impact position determines its rebound angle.
+        if self.side == 1:
+            ball.x = self.x + 24
+            ball.vx = max(6.4, abs(ball.vx) * 0.74)
+        else:
+            ball.x = self.x - 24
+            ball.vx = -max(6.4, abs(ball.vx) * 0.74)
+        ball.vy = clamp(ball.vy * 0.40 + dy * 0.11 + self.vy * 0.70, -10.5, 10.5)
+        ball.possession_lock = max(ball.possession_lock, 10.0)
+        ball.curve = ball.curve_t = ball.lift = ball.lift_v = 0.0
+        self.dive_dir = -1.0 if dy < 0 else 1.0
+        self.dive_timer = 16.0
+        self.save_flash = 12.0
+        return True
+
+    def draw(self, surface):
+        pulse = 0.5 + 0.5 * math.sin(self.animation * 2.0)
+        dive = 1.0 - self.dive_timer / 16.0 if self.dive_timer > 0.0 else 0.0
+        half_length = int(self.bar_half + dive * 8.0)
+        cx = int(self.x + self.dive_dir * dive * 2.0)
+        cy = int(self.y)
+        top, bottom = cy - half_length, cy + half_length
+
+        # Soft glow behind a compact neon bar.
+        glow = pygame.Surface((54, half_length * 2 + 30), pygame.SRCALPHA)
+        glow_alpha = int(34 + pulse * 24 + (75 if self.save_flash > 0 else 0))
+        pygame.draw.rect(glow, (*self.light, glow_alpha),
+                         (18, 10, 18, half_length * 2 + 10), border_radius=9)
+        surface.blit(glow, (cx - 27, top - 15))
+
+        pygame.draw.line(surface, (5, 11, 20), (cx, top), (cx, bottom), 17)
+        pygame.draw.line(surface, self.color, (cx, top), (cx, bottom), 11)
+        core = WHITE if self.save_flash > 0 else self.light
+        pygame.draw.line(surface, core, (cx, top + 5), (cx, bottom - 5), 4)
+        cap = WHITE if self.save_flash > 0 else self.light
+        pygame.draw.circle(surface, cap, (cx, top), 6)
+        pygame.draw.circle(surface, cap, (cx, bottom), 6)
+
+        if self.save_flash > 0:
+            pygame.draw.circle(surface, WHITE, (cx, cy), 9, 2)
 
 
 # ============================================================
@@ -1756,9 +1915,26 @@ class Game:
         self.mode = None            # None / "pvp" / "bot" / "host" / "client"
         self.state = "menu"         # menu / online_menu / join / lobby / countdown / play / goal / paused / finished
         self.prev_state = "play"
+        # Hybrid squads use two human online players and let AI fill the two open slots.
+        # The current relay connection supports one host plus one remote guest.
+        self.squad_mode = False
+        self.host_team = 0       # 0 = blue, 1 = red
+        self.guest_team = 1
+        self.team_change_pending = False
+        self.host_slot = 0
+        self.guest_slot = 1
+        self.local_slot = 0
+        self.slot_names = ["HOST", "GUEST", "AI TEAMMATE", "AI TEAMMATE"]
+        self.slot_is_human = [True, True, False, False]
+        self.lobby_blue_rect = pygame.Rect(110, 245, 520, 170)
+        self.lobby_red_rect = pygame.Rect(770, 245, 520, 170)
+        self.lobby_start_rect = pygame.Rect(W // 2 - 170, 505, 340, 54)
+        self.lobby_ready_rect = pygame.Rect(W // 2 - 170, 505, 340, 54)
         self.back_button_rect = pygame.Rect(18, 16, 48, 48)
+        # Dedicated in-match back arrow; kept separate from menu navigation.
+        self.game_back_rect = pygame.Rect(18, 16, 48, 48)
         self.menu_selection = 0
-        self.menu_rects = [pygame.Rect(W // 2 - 260, 200 + i * 76, 520, 64) for i in range(4)]
+        self.menu_rects = [pygame.Rect(W // 2 - 260, 200 + i * 76, 520, 64) for i in range(5)]
         self.on_rects = [pygame.Rect(W // 2 - 260, 175, 520, 70),
                          pygame.Rect(W // 2 - 260, 275, 520, 84),
                          pygame.Rect(W // 2 - 260, 375, 520, 84)]
@@ -1800,7 +1976,7 @@ class Game:
         self.touch_pointer_map = {}
         self.joystick_values = {"p1": (0.0, 0.0), "p2": (0.0, 0.0)}
         self.touch_controls_enabled = self.detect_touch_device()
-        self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 1}
+        self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 0}
         self.sound = Sound()
         self.profile = self.load_profile()
         self.upgrade_keys = ("shooting", "pace", "defending")
@@ -1860,10 +2036,13 @@ class Game:
         self.lobby_send_t = 0.0
         self.match_id = 0
         self.cur_mid = 0
-        self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False, "tk": 0, "t": 0.0}
+        self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False,
+                       "tk": 0, "sp": 0, "t": 0.0}
         self.net_axes = {"dx": 0.0, "dy": 0.0}
         self.p2_sh_prev = False
         self.p2_tk_prev = 0
+        self.p2_sp_prev = 0
+        self.c_special = 0
         self.ev_log = []
         self.ev_id = 0
         self.goal_history = []
@@ -1883,6 +2062,10 @@ class Game:
         self.replay_hold = 0.0
         self.replay_actor1 = None
         self.replay_actor2 = None
+        self.replay_actor3 = None
+        self.replay_actor4 = None
+        self.replay_keeper_left = Goalkeeper(1)
+        self.replay_keeper_right = Goalkeeper(2)
         self.replay_back_rect = pygame.Rect(36, H - 58, 190, 38)
         self.replay_pause_rect = pygame.Rect(W // 2 - 88, H - 58, 176, 38)
         self.replay_next_rect = pygame.Rect(W - 226, H - 58, 190, 38)
@@ -2103,6 +2286,62 @@ class Game:
         self.state = "customize"
         self.sound.play("menuok")
 
+    def online_slot_layout(self):
+        """Compute human player slots; AI fills every unoccupied active slot."""
+        has_guest = self.mode == "client" or bool(self.guest_addr or self.guest_name)
+        if not self.squad_mode:
+            return (0, 1) if has_guest else (0, -1)
+        host_team = int(clamp(self.host_team, 0, 1))
+        host_slot = 0 if host_team == 0 else 1
+        if not has_guest:
+            return host_slot, -1
+        guest_team = int(clamp(self.guest_team, 0, 1))
+        if guest_team == host_team:
+            guest_slot = 2 if guest_team == 0 else 3
+        else:
+            guest_slot = 1 if guest_team == 1 else 0
+        return host_slot, guest_slot
+
+    def refresh_online_slots(self):
+        """Refresh human/AI labels and the local player's assigned slot."""
+        self.host_slot, self.guest_slot = self.online_slot_layout()
+        if self.mode == "client":
+            self.local_slot = self.guest_slot
+        else:
+            self.local_slot = self.host_slot
+        names = ["AI TEAMMATE", "AI TEAMMATE", "AI TEAMMATE", "AI TEAMMATE"]
+        human = [False, False, False, False]
+        if self.squad_mode:
+            names[self.host_slot] = self.name + " (HOST)" if self.mode != "client" else (
+                self.lobby_names[0] or "HOST")
+            human[self.host_slot] = True
+            if self.guest_slot >= 0 and self.mode == "client":
+                names[self.guest_slot] = self.name + " (YOU)"
+                human[self.guest_slot] = True
+            elif self.guest_slot >= 0 and (self.guest_addr or self.guest_name):
+                names[self.guest_slot] = self.guest_name or "GUEST"
+                human[self.guest_slot] = True
+        else:
+            names[0] = self.name + " (HOST)" if self.mode != "client" else (
+                self.lobby_names[0] or "HOST")
+            human[0] = True
+            if self.mode == "client":
+                names[1] = self.name + " (YOU)"
+                human[1] = True
+            elif self.guest_addr or self.guest_name:
+                names[1] = self.guest_name or "GUEST"
+                human[1] = True
+            else:
+                names[1] = "OPPONENT"
+        self.slot_names = names
+        self.slot_is_human = human
+
+    def match_players(self):
+        """Return the active on-pitch players in stable snapshot/owner order."""
+        if getattr(self, "squad_mode", False):
+            return (self.p1, self.p2, self.p3, self.p4)
+        return (self.p1, self.p2)
+
     def reset_positions(self):
         self.p1 = Player(FIELD_LEFT + 180, FIELD_CY, BLUE, BLUE_DARK, BLUE_LIGHT, False)
         self.p2 = Player(FIELD_RIGHT - 180, FIELD_CY, RED, RED_DARK, RED_LIGHT, True)
@@ -2111,7 +2350,19 @@ class Game:
         self.apply_shape(self.p1, self.shape_indices[0])
         self.apply_shape(self.p2, self.shape_indices[1])
         self.apply_profile_to_player(self.p1)
+        self.p3 = Player(FIELD_LEFT + 245, FIELD_CY + 112, BLUE, BLUE_DARK, BLUE_LIGHT, False)
+        self.p4 = Player(FIELD_RIGHT - 245, FIELD_CY - 112, RED, RED_DARK, RED_LIGHT, True)
+        self.p3.radius = self.p4.radius = 21
+        self.p3.accent_color = BLUE_LIGHT
+        self.p4.accent_color = RED_LIGHT
+        self.p3.kit_name = "SQUAD AI"
+        self.p4.kit_name = "SQUAD AI"
         self.ball = SoccerBall(W // 2, FIELD_CY)
+        for player in (self.p1, self.p2, self.p3, self.p4):
+            player.special_armed = False
+            player.shot_special = None
+        self.keeper_left = Goalkeeper(1)
+        self.keeper_right = Goalkeeper(2)
         self.powerups = []
         self.bot_state.update({"think": 20.0, "lull": 0.0})
 
@@ -2122,6 +2373,12 @@ class Game:
 
     def start_match(self, mode):
         self.mode = mode
+        if mode in ("host", "client"):
+            self.refresh_online_slots()
+        if mode == "squad":
+            self.squad_mode = True
+        elif mode not in ("host", "client"):
+            self.squad_mode = False
         self.blue_score = 0
         self.red_score = 0
         self.clock_frames = 0.0
@@ -2176,7 +2433,7 @@ class Game:
         for _ in range(25):
             x = random.uniform(FIELD_LEFT + 230, FIELD_RIGHT - 230)
             y = random.uniform(FIELD_TOP + 60, FIELD_BOTTOM - 60)
-            if any(math.hypot(x - p.x, y - p.y) < 120 for p in (self.p1, self.p2)):
+            if any(math.hypot(x - p.x, y - p.y) < 120 for p in self.match_players()):
                 continue
             if math.hypot(x - self.ball.x, y - self.ball.y) < 70:
                 continue
@@ -2193,14 +2450,16 @@ class Game:
                 if len(self.powerups) < 2:
                     self.spawn_powerup()
         for pu in self.powerups[:]:
-            for idx, p in ((1, self.p1), (2, self.p2)):
+            for p in self.match_players():
                 if math.hypot(p.x - pu["x"], p.y - pu["y"]) < p.radius + 20:
-                    self.collect_powerup(pu, idx)
+                    self.collect_powerup(pu, 2 if p.is_p2 else 1, p)
                     break
 
-    def collect_powerup(self, pu, idx):
-        p = self.p1 if idx == 1 else self.p2
-        foe = self.p2 if idx == 1 else self.p1
+    def collect_powerup(self, pu, idx, player=None):
+        p = player or (self.p1 if idx == 1 else self.p2)
+        foes = [q for q in self.match_players() if q.is_p2 != p.is_p2]
+        foe = min(foes, key=lambda q: math.hypot(q.x - p.x, q.y - p.y)) if foes else (
+            self.p2 if idx == 1 else self.p1)
         kind = pu["t"]
         if pu in self.powerups:
             self.powerups.remove(pu)
@@ -2235,8 +2494,8 @@ class Game:
             self.sound.play("tackle", 0.8)
         elif typ == "steal":
             self.sound.play("steal")
-        elif typ == "post":
-            self.sound.play("post")
+        elif typ in ("post", "save"):
+            self.sound.play("post" if typ == "post" else "steal", 0.9)
         elif typ == "pu":
             self.sound.play("freeze" if int(ex) % 10 == 2 else "pickup")
 
@@ -2295,11 +2554,16 @@ class Game:
             return
         self.mode = "host"
         self.state = "lobby"
+        self.squad_mode = True
+        self.host_team = 0
+        self.guest_team = 1
         self.guest_addr = None
         self.guest_name = None
         self.guest_ready = False
         self.lobby_names = [self.name, ""]
+        self.refresh_online_slots()
         self.lobby_ready = [True, False]
+        self.refresh_online_slots()
         self.party_code = "..." if WEB_BUILD else encode_code(local_ip())
         self.public_code = None
         self.public_state = ""
@@ -2392,6 +2656,7 @@ class Game:
         self.guest_ready = False
         self.p2_sh_prev = False
         self.lobby_names = [self.name, self.guest_name or ""]
+        self.refresh_online_slots()
         self.lobby_send_t = -10.0
         self.net_msg = msg
         self.fade = 255.0
@@ -2405,18 +2670,17 @@ class Game:
         self.fade = 255.0
 
     def host_start_match(self):
-        if not self.guest_addr:
-            self.net_msg = "Waiting for a player to join."
-            return
-        if not self.guest_ready:
-            self.net_msg = "Waiting for the other player to ready up."
+        if self.guest_addr and not self.guest_ready:
+            self.net_msg = "Waiting for the other player to ready up, or ask them to leave to play with AI."
             return
         self.net_msg = ""
         self.match_id += 1
         self.ev_log.clear()
         self.lobby_names = [self.name, self.guest_name or ""]
+        self.refresh_online_slots()
         self.p2_sh_prev = False
         self.p2_tk_prev = self.net_in["tk"]
+        self.p2_sp_prev = int(self.net_in.get("sp", 0))
         self.start_match("host")
 
     def drop_guest(self, reason):
@@ -2489,24 +2753,34 @@ class Game:
                         net.send({"t": "bad_ver"}, addr)
                     elif addr == self.guest_addr:
                         self.guest_last = now
-                        net.send({"t": "welcome", "names": self.lobby_names}, addr)
+                        net.send({"t": "welcome", "names": self.lobby_names,
+                                  "sq": int(self.squad_mode), "ht": self.host_team,
+                                  "gt": self.guest_team}, addr)
                     elif self.guest_addr is None and self.state == "lobby":
                         self.guest_addr = addr
                         self.guest_name = clean_name(msg.get("name"))
                         self.guest_ready = False
                         self.guest_last = now
                         self.lobby_names = [self.name, self.guest_name]
-                        self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False, "tk": 0, "t": 0.0}
+                        self.net_in = {"dx": 0, "dy": 0, "dash": False, "sh": False,
+                                        "tk": 0, "sp": 0, "t": 0.0}
                         self.net_axes = {"dx": 0.0, "dy": 0.0}
                         self.lobby_send_t = -10.0
                         self.net_msg = ""
-                        net.send({"t": "welcome", "names": self.lobby_names}, addr)
+                        net.send({"t": "welcome", "names": self.lobby_names,
+                                  "sq": int(self.squad_mode), "ht": self.host_team,
+                                  "gt": self.guest_team}, addr)
                     else:
                         net.send({"t": "full"}, addr)
                 elif addr == self.guest_addr:
                     self.guest_last = now
                     if t == "cl":
                         self.guest_ready = bool(msg.get("r"))
+                        self.guest_team = int(clamp(int(msg.get("team", self.guest_team)), 0, 1))
+                        self.refresh_online_slots()
+                    elif t == "back":
+                        # Keep the guest connected and return both players to the party lobby.
+                        self.host_to_lobby("The other player returned to the lobby")
                     elif t == "in":
                         self.net_in = {
                             "dx": clamp(float(msg.get("dx", 0)), -1, 1),
@@ -2514,6 +2788,7 @@ class Game:
                             "dash": bool(msg.get("d")),
                             "sh": bool(msg.get("sh")),
                             "tk": int(msg.get("tk", 0)),
+                            "sp": int(msg.get("sp", 0)),
                             "t": now,
                         }
                         self.last_echo = float(msg.get("ts", 0))
@@ -2528,9 +2803,11 @@ class Game:
 
         if self.state == "lobby" and self.guest_addr and now - self.lobby_send_t > 0.2:
             self.lobby_send_t = now
+            self.refresh_online_slots()
             net.send({"t": "lobby", "names": self.lobby_names,
                       "ready": [True, self.guest_ready], "ph": "lobby",
-                      "mid": self.match_id}, self.guest_addr)
+                      "sq": int(self.squad_mode), "mid": self.match_id,
+                      "ht": self.host_team, "gt": self.guest_team}, self.guest_addr)
 
     def client_pump(self, msgs, now):
         net = self.net
@@ -2555,8 +2832,15 @@ class Game:
                     self.clock_off = None
                     self.c_shoot = False
                     self.c_tackle = 0
+                    self.c_special = 0
                     self.lobby_names = [str(names[0] or ""), str(names[1] or self.name)]
+                    self.guest_name = self.name
                     self.lobby_ready = [True, False]
+                    self.squad_mode = bool(msg.get("sq", 0))
+                    self.host_team = int(clamp(int(msg.get("ht", 0)), 0, 1))
+                    self.guest_team = int(clamp(int(msg.get("gt", 1)), 0, 1))
+                    self.team_change_pending = False
+                    self.refresh_online_slots()
                     self.fade = 255.0
                 elif t in ("full", "bad_ver") and self.joining and self.state == "join":
                     self.joining = None
@@ -2568,6 +2852,13 @@ class Game:
                         names = msg.get("names") or ["", ""]
                         self.lobby_names = [str(names[0] or ""), str(names[1] or self.name)]
                         self.lobby_ready = msg.get("ready") or [True, False]
+                        self.squad_mode = bool(msg.get("sq", self.squad_mode))
+                        self.host_team = int(clamp(int(msg.get("ht", self.host_team)), 0, 1))
+                        server_guest_team = int(clamp(int(msg.get("gt", self.guest_team)), 0, 1))
+                        if not self.team_change_pending or server_guest_team == self.guest_team:
+                            self.guest_team = server_guest_team
+                            self.team_change_pending = False
+                        self.refresh_online_slots()
                         if (self.state in GAME_STATES and msg.get("ph") == "lobby"
                                 and int(msg.get("mid", 0)) >= self.cur_mid):
                             self.client_to_lobby()
@@ -2622,7 +2913,8 @@ class Game:
           if self.state == "lobby":
             if now - self.lobby_send_t > 0.25:
               self.lobby_send_t = now
-              net.send({"t": "cl", "r": int(self.my_ready)}, self.host_addr)
+              net.send({"t": "cl", "r": int(self.my_ready),
+                        "team": int(self.guest_team)}, self.host_addr)
           elif self.state in GAME_STATES:
             self.client_send_input(now)
 
@@ -2633,7 +2925,7 @@ class Game:
         self.in_send_t = now
         dx, dy, dash = self.combined_input(pygame.key.get_pressed())
         self.net.send({"t": "in", "dx": dx, "dy": dy, "d": int(bool(dash)),
-                       "sh": int(self.c_shoot), "tk": self.c_tackle,
+                       "sh": int(self.c_shoot), "tk": self.c_tackle, "sp": self.c_special,
                        "ts": now, "pg": int(self.ping)}, self.host_addr)
 
     def host_send_snapshot(self, now):
@@ -2642,14 +2934,21 @@ class Game:
         self.snap_send_t = now
         ht = now - self.host_t0
         b = self.ball
-        owner = 1 if b.owner is self.p1 else (2 if b.owner is self.p2 else 0)
+        active_players = self.match_players()
+        owner = next((i + 1 for i, player in enumerate(active_players) if b.owner is player), 0)
         snap = {"t": "snap", "ht": round(ht, 4), "mid": self.match_id,
                 "st": STATE_IDX[self.state],
                 "cd": r1(self.countdown), "ct": self.countdown_total,
                 "cl": r1(self.clock_frames), "gt": r1(self.goal_timer),
-                "s": [self.blue_score, self.red_score],
-                "p": [pack_player(self.p1), pack_player(self.p2)],
-                "b": [r2(b.x), r2(b.y), r2(b.vx), r2(b.vy), owner, r2(b.rotation)],
+                "s": [self.blue_score, self.red_score], "sq": int(self.squad_mode),
+                "hs": int(self.host_slot), "gs": int(self.guest_slot),
+                "hn": list(self.slot_names),
+                "p": [pack_player(player) for player in active_players],
+                "gk": [[r2(k.y), r2(k.vy), r1(k.dive_timer), r2(k.dive_dir),
+                        r1(k.save_flash), r2(k.animation)]
+                       for k in (self.keeper_left, self.keeper_right)],
+                "b": [r2(b.x), r2(b.y), r2(b.vx), r2(b.vy), owner, r2(b.rotation),
+                      r2(b.lift), r2(b.curve), r1(b.curve_t)],
                 "ev": [e[:5] for e in self.ev_log if ht - e[5] < 0.6][-8:],
                 "e": self.last_echo, "pg": int(self.guest_ping),
                 "ot": int(self.overtime), "md": int(self.match_duration),
@@ -2725,6 +3024,19 @@ class Game:
         elif typ == "steal":
             self.shake = max(self.shake, 6)
             self.particles.append(Particle(x, y, 0, 0, GOLD, 12, 18, ring=True))
+        elif typ == "save":
+            keeper = self.keeper_left if int(ex) == 1 else self.keeper_right
+            keeper.dive_timer = 19.0
+            keeper.dive_dir = -1.0 if y < keeper.y else 1.0
+            keeper.save_flash = 12.0
+            for _ in range(12):
+                self.particles.append(Particle(x, y, random.uniform(-3, 3), random.uniform(-3, 3),
+                                               keeper.light, random.randint(2, 4), 18))
+        elif typ == "special":
+            special_col = BLUE_LIGHT if int(ex) == 1 else GOLD
+            for _ in range(16):
+                self.particles.append(Particle(x, y, random.uniform(-4, 4), random.uniform(-4, 4),
+                                               special_col, random.randint(2, 4), 22))
         elif typ == "post":
             self.shake = max(self.shake, 5)
             for _ in range(8):
@@ -2811,12 +3123,23 @@ class Game:
         self.match_duration = float(b.get("md", self.match_duration))
         self.powerups = [{"t": int(a[0]), "x": float(a[1]), "y": float(a[2])}
                          for a in (b.get("pw") or [])]
+        self.squad_mode = bool(b.get("sq", self.squad_mode))
+        self.host_slot = int(clamp(int(b.get("hs", self.host_slot)), 0, 3))
+        self.guest_slot = int(clamp(int(b.get("gs", self.guest_slot)), 0, 3))
+        self.local_slot = self.guest_slot
+        if isinstance(b.get("hn"), list) and len(b["hn"]) == 4:
+            self.slot_names = [clean_name(n, "AI TEAMMATE") for n in b["hn"]]
+            self.slot_is_human = ["AI" not in n.upper() for n in self.slot_names]
         sx = b.get("x")
         if sx and len(sx) >= 8:
             self.stats = {"shots": [sx[0], sx[1]], "steals": [sx[2], sx[3]],
                           "poss": [sx[4], sx[5]], "pu": [sx[6], sx[7]]}
 
-        for p, pa, pb in ((self.p1, a["p"][0], b["p"][0]), (self.p2, a["p"][1], b["p"][1])):
+        remote_players = (self.p1, self.p2, self.p3, self.p4) if self.squad_mode else (self.p1, self.p2)
+        for player_index, p in enumerate(remote_players):
+            if player_index >= len(b.get("p", [])) or player_index >= len(a.get("p", [])):
+                continue
+            pa, pb = a["p"][player_index], b["p"][player_index]
             jump = math.hypot(pb[0] - pa[0], pb[1] - pa[1]) > 150     # kickoff reset: don't slide
             ff = 1.0 if jump else f
             if a is not b and not jump:
@@ -2845,6 +3168,11 @@ class Game:
             p.exhausted = bool(pb[13])
             if len(pb) > 16:
                 p.boost_t, p.mega_t, p.frozen_t = float(pb[14]), float(pb[15]), float(pb[16])
+            if len(pb) > 17:
+                p.special_armed = bool(pb[17])
+                p.special_kind = "chip" if len(pb) > 18 and int(pb[18]) else "curve"
+            if len(pb) > 19:
+                p.special_cooldown = float(pb[19])
             speed = math.hypot(p.vx, p.vy)
             p.animation_time += (0.16 + speed * 0.025) * dt
             p.dribble_phase += (0.20 + speed * 0.03) * dt
@@ -2864,10 +3192,32 @@ class Game:
             ball.y += float(bb[3]) * 60.0 * extrapolate
         ball.vx, ball.vy = float(bb[2]), float(bb[3])
         ball.rotation = float(bb[5])
+        ball.lift = float(bb[6]) if len(bb) > 6 else 0.0
+        ball.curve = float(bb[7]) if len(bb) > 7 else 0.0
+        ball.curve_t = float(bb[8]) if len(bb) > 8 else 0.0
         owner = int(bb[4])
-        ball.owner = self.p1 if owner == 1 else (self.p2 if owner == 2 else None)
-        self.p1.has_ball = owner == 1
-        self.p2.has_ball = owner == 2
+        all_players = (self.p1, self.p2, self.p3, self.p4)
+        ball.owner = all_players[owner - 1] if 1 <= owner <= len(all_players) else None
+        for idx, player in enumerate(all_players, 1):
+            player.has_ball = owner == idx
+        keeper_a = a.get("gk") if isinstance(a, dict) else None
+        keeper_b = b.get("gk") if isinstance(b, dict) else None
+        if (isinstance(keeper_a, list) and isinstance(keeper_b, list)
+                and len(keeper_a) >= 2 and len(keeper_b) >= 2):
+            for keeper, ka, kb in zip((self.keeper_left, self.keeper_right), keeper_a, keeper_b):
+                if not isinstance(ka, (list, tuple)) or not isinstance(kb, (list, tuple)):
+                    keeper.update(ball, dt)
+                    continue
+                keeper.y = lerp(float(ka[0]), float(kb[0]), f)
+                keeper.vy = lerp(float(ka[1]), float(kb[1]), f)
+                keeper.dive_timer = lerp(float(ka[2]), float(kb[2]), f)
+                keeper.dive_dir = lerp(float(ka[3]), float(kb[3]), f)
+                keeper.save_flash = lerp(float(ka[4]), float(kb[4]), f)
+                keeper.animation = lerp(float(ka[5]), float(kb[5]), f)
+        else:
+            # Backward compatibility with snapshots from the previous build.
+            self.keeper_left.update(ball, dt)
+            self.keeper_right.update(ball, dt)
         sp = math.hypot(ball.vx, ball.vy)
         if ball.owner is None and sp > 7:
             ball.trail.append((ball.x, ball.y))
@@ -2890,11 +3240,24 @@ class Game:
     # INPUT
     # --------------------------------------------------------
 
+    def arm_special(self, player):
+        """Arm the next shot; successive uses alternate curve and chip."""
+        if player.special_cooldown > 0:
+            self.sound.play("click", 0.55)
+            return False
+        if player.special_armed:
+            player.special_kind = "chip" if player.special_kind == "curve" else "curve"
+        player.special_armed = True
+        self.sound.play("menuok", 0.7)
+        return True
+
     def release_shot(self, player):
         if player.charging:
             player.charging = False
             player.shot_charge = player.charge
             player.charge = 0.0
+            player.shot_special = player.special_kind if player.special_armed else None
+            player.special_armed = False
             player.shot_buffer = 9.0
 
     def handle_events(self):
@@ -2964,6 +3327,35 @@ class Game:
         elif state in ("penalties", "penalty_finished", "finished"):
             self.return_to_menu()
 
+    def game_navigate_back(self):
+        """Return from a live match without accidentally disconnecting online guests."""
+        self.sound.play("click")
+        if self.mode == "host":
+            self.host_to_lobby()
+        elif self.mode == "client":
+            if self.host_addr:
+                self.net.send({"t": "back"}, self.host_addr)
+            self.client_to_lobby()
+        else:
+            self.return_to_menu()
+
+    def draw_game_back_button(self):
+        """Compact top-left back arrow shown over live gameplay."""
+        if self.state not in ("countdown", "play", "goal", "paused"):
+            return
+        rect = self.game_back_rect
+        cx, cy = rect.center
+        hover = rect.collidepoint(pygame.mouse.get_pos())
+        # Slightly translucent dark-glass backing keeps the arrow readable on grass.
+        pygame.draw.circle(screen, (5, 16, 27), (cx, cy), 25)
+        pygame.draw.circle(screen, (67, 110, 137), (cx, cy), 23, 2)
+        pygame.draw.circle(screen, (17, 37, 53) if not hover else (31, 62, 81),
+                           (cx, cy), 20)
+        pygame.draw.circle(screen, GOLD if hover else (125, 215, 239), (cx, cy), 20, 1)
+        pygame.draw.line(screen, WHITE, (cx + 8, cy), (cx - 7, cy), 3)
+        pygame.draw.line(screen, WHITE, (cx - 7, cy), (cx + 1, cy - 8), 3)
+        pygame.draw.line(screen, WHITE, (cx - 7, cy), (cx + 1, cy + 8), 3)
+
     def draw_back_button(self):
         """Small round arrow button matching the game's dark glass UI."""
         if self.state not in BACK_NAV_STATES:
@@ -2989,12 +3381,10 @@ class Game:
             self.start_match("bot")
         elif i == 2:
             self.open_online_menu()
-            if WEB_BUILD:
-                self.net_msg = "Online party mode is not available in the browser build. Try 1 V 1 or 1 V BOT."
-            else:
-                self.open_online_menu()
         elif i == 3:
             self.start_penalty_shootout(standalone=True)
+        elif i == 4:
+            self.start_match("squad")
 
     def events_menu(self, event):
         if event.type == pygame.MOUSEMOTION:
@@ -3021,6 +3411,8 @@ class Game:
                 self.open_upgrades("menu")
             elif k in (pygame.K_4, pygame.K_KP4):
                 self.menu_choose(3)
+            elif k in (pygame.K_5, pygame.K_KP5):
+                self.menu_choose(4)
             elif k in (pygame.K_o,):
                 self.open_settings()
             elif k in (pygame.K_1, pygame.K_KP1):
@@ -3033,7 +3425,7 @@ class Game:
                 self.menu_selection = max(0, self.menu_selection - 1)
                 self.sound.play("click")
             elif k in (pygame.K_DOWN, pygame.K_s):
-                self.menu_selection = min(3, self.menu_selection + 1)
+                self.menu_selection = min(4, self.menu_selection + 1)
                 self.sound.play("click")
             elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self.menu_choose(self.menu_selection)
@@ -3179,10 +3571,75 @@ class Game:
                 self.join_text += event.unicode
 
     def events_lobby(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if getattr(self, "lobby_blue_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
+                if self.squad_mode:
+                    if self.mode == "host":
+                        self.host_team = 0
+                    else:
+                        self.guest_team = 0
+                        self.my_ready = False
+                        self.team_change_pending = True
+                    self.refresh_online_slots()
+                    self.lobby_send_t = -10.0
+                    self.sound.play("menuok")
+                return
+            if getattr(self, "lobby_red_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
+                if self.squad_mode:
+                    if self.mode == "host":
+                        self.host_team = 1
+                    else:
+                        self.guest_team = 1
+                        self.my_ready = False
+                        self.team_change_pending = True
+                    self.refresh_online_slots()
+                    self.lobby_send_t = -10.0
+                    self.sound.play("menuok")
+                return
+            if self.mode == "host" and getattr(self, "lobby_squad_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
+                self.squad_mode = not self.squad_mode
+                self.refresh_online_slots()
+                self.net_msg = "AI WILL FILL OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1 ENABLED"
+                self.lobby_send_t = -10.0
+                self.sound.play("menuok")
+                return
+            if self.mode == "host" and getattr(self, "lobby_start_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
+                self.host_start_match()
+                return
+            if self.mode == "client" and getattr(self, "lobby_ready_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
+                self.my_ready = not self.my_ready
+                self.lobby_send_t = -10.0
+                self.sound.play("menuok")
+                return
+            return
         if event.type != pygame.KEYDOWN:
             return
         k = event.key
-        if k == pygame.K_n:
+        if k == pygame.K_f and self.mode == "host":
+            self.squad_mode = not self.squad_mode
+            self.refresh_online_slots()
+            self.net_msg = "AI WILL FILL OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1 ENABLED"
+            self.lobby_send_t = -10.0
+            self.sound.play("menuok")
+        elif k in (pygame.K_b, pygame.K_1) and self.squad_mode:
+            if self.mode == "host":
+                self.host_team = 0
+            else:
+                self.guest_team = 0
+                self.my_ready = False
+                self.team_change_pending = True
+            self.refresh_online_slots()
+            self.lobby_send_t = -10.0
+        elif k in (pygame.K_r, pygame.K_2) and self.squad_mode:
+            if self.mode == "host":
+                self.host_team = 1
+            else:
+                self.guest_team = 1
+                self.my_ready = False
+                self.team_change_pending = True
+            self.refresh_online_slots()
+            self.lobby_send_t = -10.0
+        elif k == pygame.K_n:
             self.toggle_sound()
         elif k == pygame.K_ESCAPE:
             self.leave_party()
@@ -3196,6 +3653,19 @@ class Game:
             self.lookup_public()
 
     def events_game(self, event):
+
+        # The in-match back arrow is checked before joystick/action hitboxes so a
+        # tap in the top-left corner always navigates back instead of moving.
+        if self.state in ("countdown", "play", "goal", "paused"):
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and self.game_back_rect.collidepoint(event.pos)):
+                self.game_navigate_back()
+                return
+            if event.type == pygame.FINGERDOWN:
+                back_pos = (int(event.x * W), int(event.y * H))
+                if self.game_back_rect.collidepoint(back_pos):
+                    self.game_navigate_back()
+                    return
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.state == "play" and self.handle_touch_pointer("mouse", event.pos, True):
@@ -3266,9 +3736,15 @@ class Game:
                     self.c_shoot = False
                 return
             if event.key == pygame.K_e:
-                self.release_shot(self.p1)
+                local_player = (self.match_players()[self.host_slot]
+                                if self.mode == "host" else self.p1)
+                self.release_shot(local_player)
             elif event.key == pygame.K_p:
-                self.release_shot(self.p2 if self.mode == "pvp" else self.p1)
+                if self.mode == "host":
+                    players = self.match_players()
+                    self.release_shot(players[int(clamp(self.host_slot, 0, len(players) - 1))])
+                else:
+                    self.release_shot(self.p2 if self.mode == "pvp" else self.p1)
             return
 
         if event.type != pygame.KEYDOWN:
@@ -3282,12 +3758,16 @@ class Game:
             return
 
         if self.mode == "client":
-            if k == pygame.K_ESCAPE or (k == pygame.K_m and self.state == "finished"):
+            if k == pygame.K_ESCAPE and self.state in GAME_STATES:
+                self.game_navigate_back()
+            elif k == pygame.K_ESCAPE or (k == pygame.K_m and self.state == "finished"):
                 self.leave_party()
             elif k in (pygame.K_e, pygame.K_p):
                 self.c_shoot = True
             elif k in (pygame.K_r, pygame.K_l):
                 self.c_tackle += 1
+            elif k == pygame.K_q:
+                self.c_special += 1
             return
 
         if self.mode == "host":
@@ -3328,17 +3808,26 @@ class Game:
         if self.state != "play":
             return
 
+        local_player = (self.match_players()[self.host_slot]
+                        if self.mode == "host" else self.p1)
         if k == pygame.K_e:
-            self.p1.charging = True
-            self.p1.charge = 0.0
+            local_player.charging = True
+            local_player.charge = 0.0
         elif k == pygame.K_r:
-            self.p1.tackle_buffer = 8.0
+            local_player.tackle_buffer = 8.0
         elif k == pygame.K_p:
-            pl = self.p2 if self.mode == "pvp" else self.p1
+            if self.mode == "host":
+                pl = local_player
+            else:
+                pl = self.p2 if self.mode == "pvp" else self.p1
             pl.charging = True
             pl.charge = 0.0
         elif k == pygame.K_l:
             (self.p2 if self.mode == "pvp" else self.p1).tackle_buffer = 8.0
+        elif k == pygame.K_q:
+            self.arm_special(local_player)
+        elif k == pygame.K_PERIOD and self.mode == "pvp":
+            self.arm_special(self.p2)
 
     def attempt_tackle(self, player):
         if not player.tackle():
@@ -3364,11 +3853,18 @@ class Game:
             return
         if p.shot_buffer > 0:
             p.shot_buffer -= dt
-            if self.ball.shoot(p, self.particles, p.shot_charge):
+            if self.ball.shoot(p, self.particles, p.shot_charge, p.shot_special):
+                used_special = p.shot_special
                 p.shot_buffer = 0.0
+                p.shot_special = None
                 self.stats["shots"][1 if p.is_p2 else 0] += 1
                 self.shake = max(self.shake, 2.0 + 4.0 * p.shot_charge)
                 self.emit("kick", self.ball.x, self.ball.y, p.shot_charge)
+                if used_special:
+                    p.special_cooldown = 260.0
+                    p.special_kind = "chip" if used_special == "curve" else "curve"
+                    self.emit("special", self.ball.x, self.ball.y,
+                              1 if used_special == "curve" else 2)
         if p.tackle_buffer > 0:
             p.tackle_buffer -= dt
             if self.attempt_tackle(p):
@@ -3379,16 +3875,21 @@ class Game:
         ni = self.net_in
         fresh = (now - ni["t"]) < 0.5
         sh = bool(ni["sh"]) and fresh
+        players = self.match_players()
+        remote = players[self.guest_slot] if 0 <= self.guest_slot < len(players) else self.p2
         if self.state == "play":
             if sh and not self.p2_sh_prev:
-                self.p2.charging = True
-                self.p2.charge = 0.0
+                remote.charging = True
+                remote.charge = 0.0
             elif not sh and self.p2_sh_prev:
-                self.release_shot(self.p2)
+                self.release_shot(remote)
             if ni["tk"] != self.p2_tk_prev:
-                self.p2.tackle_buffer = 8.0
+                remote.tackle_buffer = 8.0
+            if int(ni.get("sp", 0)) != self.p2_sp_prev:
+                self.arm_special(remote)
         self.p2_sh_prev = sh
         self.p2_tk_prev = ni["tk"]
+        self.p2_sp_prev = int(ni.get("sp", 0))
 
     # --------------------------------------------------------
     # BOT  (deliberately a bit bad: slow reactions, sloppy aim, naps)
@@ -3468,22 +3969,109 @@ class Game:
     # UPDATE
     # --------------------------------------------------------
 
+    def squad_ai_inputs(self, player, dt):
+        """Casual squad AI: slow reactions, loose positioning and no automatic sprinting."""
+        direction = -1.0 if player.is_p2 else 1.0
+        ball = self.ball
+        allies = [q for q in self.match_players()
+                  if q is not player and q.is_p2 == player.is_p2]
+        ally = min(allies, key=lambda q: math.hypot(q.x - player.x, q.y - player.y)) if allies else player
+        owner = ball.owner
+
+        if not hasattr(player, "ai_rethink"):
+            player.ai_rethink = random.uniform(5.0, 14.0)
+            player.ai_target_x = player.x
+            player.ai_target_y = player.y
+
+        player.ai_rethink -= dt
+        if player.ai_rethink <= 0.0:
+            player.ai_rethink = random.uniform(18.0, 31.0)  # roughly 0.3–0.5 seconds
+            if owner is player:
+                target_x = player.x + direction * 145
+                target_y = lerp(player.y, FIELD_CY, 0.12)
+            elif owner is not None and owner.is_p2 == player.is_p2:
+                side_offset = -125 if player.y > ally.y else 125
+                target_x = owner.x + direction * 115
+                target_y = owner.y + side_offset
+            elif owner is not None:
+                # AI only presses when the opponent is fairly close; otherwise it drifts back.
+                if math.hypot(player.x - owner.x, player.y - owner.y) < 205:
+                    target_x, target_y = owner.x, owner.y
+                else:
+                    target_x = lerp(player.x, ball.x - direction * 115, 0.25)
+                    target_y = lerp(FIELD_CY, ball.y, 0.30)
+            else:
+                own_dist = math.hypot(ball.x - player.x, ball.y - player.y)
+                ally_dist = math.hypot(ball.x - ally.x, ball.y - ally.y)
+                if own_dist <= ally_dist + 18:
+                    target_x, target_y = ball.x + ball.vx * 0.8, ball.y + ball.vy * 0.8
+                else:
+                    target_x = lerp(ally.x, ball.x + direction * 145, 0.42)
+                    target_y = lerp(ally.y, ball.y + (105 if player.y < ally.y else -105), 0.42)
+
+            # Imperfect reads: AI targets are intentionally a little off.
+            player.ai_target_x = clamp(target_x + random.uniform(-48, 48),
+                                       FIELD_LEFT + 48, FIELD_RIGHT - 48)
+            player.ai_target_y = clamp(target_y + random.uniform(-58, 58),
+                                       FIELD_TOP + 42, FIELD_BOTTOM - 42)
+
+        dx = player.ai_target_x - player.x
+        dy = player.ai_target_y - player.y
+        distance = math.hypot(dx, dy)
+        if distance < 17:
+            return 0.0, 0.0, False
+        strength = min(0.66, 0.42 + distance / 420.0)
+        # Teammates do not sprint continuously; humans keep the pace advantage.
+        return dx / distance * strength, dy / distance * strength, False
+
+    def squad_ai_actions(self, player, dt):
+        """Less clinical AI: tackles and shots need a pause and a bit of luck."""
+        if player.frozen_t > 0:
+            return
+        if not hasattr(player, "ai_action_wait"):
+            player.ai_action_wait = random.uniform(14.0, 30.0)
+        player.ai_action_wait = max(0.0, player.ai_action_wait - dt)
+        if player.ai_action_wait > 0.0:
+            return
+
+        ball = self.ball
+        if ball.owner is not None and ball.owner.is_p2 != player.is_p2:
+            dist = math.hypot(ball.owner.x - player.x, ball.owner.y - player.y)
+            if player.tackle_cooldown <= 0 and dist < 59 and random.random() < 0.20:
+                player.tackle_buffer = max(player.tackle_buffer, 2.5)
+                player.ai_action_wait = random.uniform(24.0, 42.0)
+        elif ball.owner is player:
+            goal_x = FIELD_LEFT - 20 if player.is_p2 else FIELD_RIGHT + 20
+            distance = abs(goal_x - player.x)
+            # AI waits until it is reasonably close and occasionally wastes a shooting chance.
+            if distance < 390 and player.shot_buffer <= 0 and random.random() < 0.30:
+                aim_error = random.uniform(-115, 115)
+                aim_y = clamp(FIELD_CY + aim_error, GOAL_TOP + 20, GOAL_BOTTOM - 20)
+                fx, fy = normalize(-1.0 if player.is_p2 else 1.0, (aim_y - player.y) / 310.0)
+                player.facing_x, player.facing_y = fx, fy
+                player.shot_charge = random.uniform(0.04, 0.22)
+                player.shot_buffer = 2.5
+                player.ai_action_wait = random.uniform(30.0, 52.0)
+
     def separate_players(self):
-        dx = self.p2.x - self.p1.x
-        dy = self.p2.y - self.p1.y
-        dist = math.hypot(dx, dy)
-        min_dist = self.p1.radius + self.p2.radius
-        if dist < min_dist:
-            if dist < 0.001:
-                dx, dy, dist = 1.0, 0.0, 1.0
-            nx, ny = dx / dist, dy / dist
-            push = (min_dist - dist) / 2
-            self.p1.x -= nx * push
-            self.p1.y -= ny * push
-            self.p2.x += nx * push
-            self.p2.y += ny * push
-            self.p1.clamp_to_field()
-            self.p2.clamp_to_field()
+        players = self.match_players()
+        for i, first in enumerate(players):
+            for second in players[i + 1:]:
+                dx = second.x - first.x
+                dy = second.y - first.y
+                dist = math.hypot(dx, dy)
+                min_dist = first.radius + second.radius
+                if dist < min_dist:
+                    if dist < 0.001:
+                        dx, dy, dist = 1.0, 0.0, 1.0
+                    nx, ny = dx / dist, dy / dist
+                    push = (min_dist - dist) / 2
+                    first.x -= nx * push
+                    first.y -= ny * push
+                    second.x += nx * push
+                    second.y += ny * push
+                    first.clamp_to_field()
+                    second.clamp_to_field()
 
 
     def touch_down(self, name):
@@ -3491,7 +4079,10 @@ class Game:
             return
         self.touch_held.add(name)
         side, action = name.split("_", 1)
-        player = self.p2 if side == "p2" else self.p1
+        if self.mode == "host":
+            player = self.match_players()[int(clamp(self.host_slot, 0, len(self.match_players()) - 1))]
+        else:
+            player = self.p2 if side == "p2" else self.p1
         if action == "shoot":
             if self.mode == "client":
                 self.c_shoot = True
@@ -3503,6 +4094,11 @@ class Game:
                 self.c_tackle += 1
             else:
                 player.tackle_buffer = 8.0
+        elif action == "skill":
+            if self.mode == "client":
+                self.c_special += 1
+            else:
+                self.arm_special(player)
         elif action == "dash":
             # Dash is read continuously from touch_held by combined_input/read_inputs.
             pass
@@ -3515,6 +4111,9 @@ class Game:
         if action == "shoot":
             if self.mode == "client":
                 self.c_shoot = False
+            elif self.mode == "host":
+                players = self.match_players()
+                self.release_shot(players[int(clamp(self.host_slot, 0, len(players) - 1))])
             else:
                 self.release_shot(self.p2 if side == "p2" else self.p1)
 
@@ -3530,15 +4129,18 @@ class Game:
                 "p1_dash": circle(225, H - 220, 37),
                 "p1_tackle": circle(225, H - 125, 37),
                 "p1_shoot": circle(335, H - 172, 49),
+                "p1_skill": circle(335, H - 65, 34),
                 "p2_dash": circle(W - 225, H - 220, 37),
                 "p2_tackle": circle(W - 225, H - 125, 37),
                 "p2_shoot": circle(W - 335, H - 172, 49),
+                "p2_skill": circle(W - 335, H - 65, 34),
             }
         else:
             rects = {
                 "p1_dash": circle(W - 225, H - 220, 37),
                 "p1_tackle": circle(W - 225, H - 125, 37),
                 "p1_shoot": circle(W - 112, H - 170, 51),
+                "p1_skill": circle(W - 112, H - 65, 34),
             }
         return rects
 
@@ -3671,15 +4273,19 @@ class Game:
 
         if self.state == "finished":
             self.update_particles(dt)
-            self.p1.tick_timers(dt)
-            self.p2.tick_timers(dt)
+            for player in self.match_players():
+                player.tick_timers(dt)
+            self.keeper_left.update(self.ball, dt)
+            self.keeper_right.update(self.ball, dt)
             if random.random() < 0.5 * dt:
                 self.spawn_confetti()
             return
 
         if self.state == "countdown":
-            self.p1.update(0, 0, False, dt, self.particles)
-            self.p2.update(0, 0, False, dt, self.particles)
+            for player in self.match_players():
+                player.update(0, 0, False, dt, self.particles)
+            self.keeper_left.update(self.ball, dt)
+            self.keeper_right.update(self.ball, dt)
             self.ball.update(dt, self.particles)
             self.update_particles(dt)
             self.countdown -= dt
@@ -3690,8 +4296,10 @@ class Game:
 
         if self.state == "goal":
             slow = dt * 0.35
-            self.p1.update(0, 0, False, slow, self.particles)
-            self.p2.update(0, 0, False, slow, self.particles)
+            for player in self.match_players():
+                player.update(0, 0, False, slow, self.particles)
+            self.keeper_left.update(self.ball, slow)
+            self.keeper_right.update(self.ball, slow)
             self.ball.update(slow, self.particles)
             self.update_particles(dt * 0.6)
             self.goal_timer -= dt
@@ -3707,29 +4315,60 @@ class Game:
         keys = pygame.key.get_pressed()
         in1, in2 = self.read_inputs(keys)
 
-        self.p1.update(*in1, dt, self.particles)
-        if self.mode == "pvp":
-            self.p2.update(*in2, dt, self.particles)
-        elif self.mode == "host":
-            ni = self.net_in
-            fresh = time.perf_counter() - ni["t"] <= 0.5
-            target_x = float(ni["dx"]) if fresh else 0.0
-            target_y = float(ni["dy"]) if fresh else 0.0
-            blend = ease(0.52, dt)
-            self.net_axes["dx"] = lerp(self.net_axes["dx"], target_x, blend)
-            self.net_axes["dy"] = lerp(self.net_axes["dy"], target_y, blend)
-            self.p2.update(self.net_axes["dx"], self.net_axes["dy"],
-                           bool(ni["dash"] and fresh), dt, self.particles)
-        else:
-            self.p2.update(*self.bot_inputs(dt), dt, self.particles)
-            self.bot_actions(dt)
+        if self.mode == "host":
+            # Host-authoritative hybrid 2v2: host and guest control their selected
+            # slots; every unoccupied slot is driven by the squad AI.
+            active = self.match_players()
+            host_index = int(clamp(self.host_slot, 0, len(active) - 1))
+            guest_index = self.guest_slot
+            active[host_index].update(*self.combined_input(keys), dt, self.particles)
 
-        self.process_actions(self.p1, dt)
-        self.process_actions(self.p2, dt)
+            if guest_index >= 0:
+                ni = self.net_in
+                fresh = time.perf_counter() - ni["t"] <= 0.5
+                target_x = float(ni["dx"]) if fresh else 0.0
+                target_y = float(ni["dy"]) if fresh else 0.0
+                blend = ease(0.52, dt)
+                self.net_axes["dx"] = lerp(self.net_axes["dx"], target_x, blend)
+                self.net_axes["dy"] = lerp(self.net_axes["dy"], target_y, blend)
+                active[guest_index].update(self.net_axes["dx"], self.net_axes["dy"],
+                                           bool(ni["dash"] and fresh), dt, self.particles)
+
+            # In a solo hosted match the guest slot is also AI-controlled.
+            for index, teammate in enumerate(active):
+                if index == host_index or index == guest_index:
+                    continue
+                teammate.update(*self.squad_ai_inputs(teammate, dt), dt, self.particles)
+                self.squad_ai_actions(teammate, dt)
+        else:
+            self.p1.update(*in1, dt, self.particles)
+            if self.mode == "pvp":
+                self.p2.update(*in2, dt, self.particles)
+            else:
+                self.p2.update(*self.bot_inputs(dt), dt, self.particles)
+                self.bot_actions(dt)
+
+            if self.squad_mode:
+                for teammate in (self.p3, self.p4):
+                    teammate.update(*self.squad_ai_inputs(teammate, dt), dt, self.particles)
+                    self.squad_ai_actions(teammate, dt)
+
+        for player in self.match_players():
+            self.process_actions(player, dt)
         self.separate_players()
 
+        self.keeper_left.update(self.ball, dt)
+        self.keeper_right.update(self.ball, dt)
         self.ball.update(dt, self.particles)
-        for p in (self.p1, self.p2):
+        for keeper in (self.keeper_left, self.keeper_right):
+            if keeper.try_save(self.ball):
+                self.shake = max(self.shake, 7.0)
+                self.emit("save", keeper.x, keeper.y, keeper.side)
+                for _ in range(18):
+                    self.particles.append(Particle(keeper.x, keeper.y,
+                        random.uniform(-4, 4), random.uniform(-4, 4), keeper.light,
+                        random.randint(2, 4), 20))
+        for p in self.match_players():
             if self.ball.check_collision(p) == "steal":
                 self.stats["steals"][1 if p.is_p2 else 0] += 1
                 self.shake = max(self.shake, 6)
@@ -3741,10 +4380,8 @@ class Game:
             self.emit("post", self.ball.x, self.ball.y)
 
         holder = self.ball.owner
-        if holder is self.p1:
-            self.stats["poss"][0] += dt
-        elif holder is self.p2:
-            self.stats["poss"][1] += dt
+        if holder is not None:
+            self.stats["poss"][1 if holder.is_p2 else 0] += dt
         self.update_powerups(dt)
 
         self.update_particles(dt)
@@ -3782,8 +4419,16 @@ class Game:
         return {
             "p1": self._replay_player_state(self.p1),
             "p2": self._replay_player_state(self.p2),
+            "p3": self._replay_player_state(self.p3) if self.squad_mode else None,
+            "p4": self._replay_player_state(self.p4) if self.squad_mode else None,
+            "kl": [float(self.keeper_left.y), float(self.keeper_left.vy),
+                   float(self.keeper_left.dive_timer), float(self.keeper_left.dive_dir),
+                   float(self.keeper_left.save_flash), float(self.keeper_left.animation)],
+            "kr": [float(self.keeper_right.y), float(self.keeper_right.vy),
+                   float(self.keeper_right.dive_timer), float(self.keeper_right.dive_dir),
+                   float(self.keeper_right.save_flash), float(self.keeper_right.animation)],
             "bx": float(self.ball.x), "by": float(self.ball.y),
-            "br": float(self.ball.rotation),
+            "bl": float(self.ball.lift), "br": float(self.ball.rotation),
             "trail": [(float(x), float(y)) for x, y in self.ball.trail[-10:]],
             "clock": max(0.0, float(self.clock_frames) / 60.0),
         }
@@ -3815,7 +4460,16 @@ class Game:
                                     self.p1.dark_color, self.p1.light_color, False)
         self.replay_actor2 = Player(self.p2.x, self.p2.y, self.p2.color,
                                     self.p2.dark_color, self.p2.light_color, True)
-        for src, dst in ((self.p1, self.replay_actor1), (self.p2, self.replay_actor2)):
+        replay_pairs = [(self.p1, self.replay_actor1), (self.p2, self.replay_actor2)]
+        self.replay_actor3 = self.replay_actor4 = None
+        if self.squad_mode:
+            self.replay_actor3 = Player(self.p3.x, self.p3.y, self.p3.color,
+                                        self.p3.dark_color, self.p3.light_color, False)
+            self.replay_actor4 = Player(self.p4.x, self.p4.y, self.p4.color,
+                                        self.p4.dark_color, self.p4.light_color, True)
+            replay_pairs.extend(((self.p3, self.replay_actor3),
+                                 (self.p4, self.replay_actor4)))
+        for src, dst in replay_pairs:
             dst.color, dst.dark_color, dst.light_color = src.color, src.dark_color, src.light_color
             dst.accent_color = src.accent_color
             dst.kit_name = getattr(src, "kit_name", "CUSTOM")
@@ -3853,7 +4507,7 @@ class Game:
         self.award_match_rewards()
         self.state = "finished"
         self.powerups = []
-        for p in (self.p1, self.p2):
+        for p in self.match_players():
             p.charging = False
         for _ in range(60):
             self.spawn_confetti()
@@ -4135,7 +4789,7 @@ class Game:
 
     def award_goal_coins(self, player_number):
         """Grant career coins when the main player scores a genuine shot goal."""
-        if self.mode not in ("bot", "pvp") or player_number != 1:
+        if self.mode not in ("bot", "pvp", "squad") or player_number != 1:
             return
         if self.ball.last_shot_side != 1:
             return  # don't award coins for an own goal or an opponent's shot
@@ -4154,7 +4808,7 @@ class Game:
         if self.match_rewarded:
             return
         self.match_rewarded = True
-        if self.mode not in ("bot", "pvp"):
+        if self.mode not in ("bot", "pvp", "squad"):
             return
         if self.penalty_finished and not self.penalty_standalone and self.penalty_winner in (0, 1):
             winner = self.penalty_winner + 1
@@ -4187,9 +4841,10 @@ class Game:
             self.red_score += 1
 
         self.award_goal_coins(player_number)
-        scorer = self.p1 if player_number == 1 else self.p2
-        scorer.celebration_timer = 150.0
-        scorer.flash_timer = max(scorer.flash_timer, 24.0)
+        for scorer in self.match_players():
+            if (2 if scorer.is_p2 else 1) == player_number:
+                scorer.celebration_timer = 150.0
+                scorer.flash_timer = max(scorer.flash_timer, 24.0)
 
         # Preserve the action leading into the goal. Clips are played back later
         # as short slow-motion replays on the full-time highlight screen.
@@ -4206,10 +4861,12 @@ class Game:
 
         self.state = "goal"
         self.goal_timer = 150.0
-        for p in (self.p1, self.p2):
+        for p in self.match_players():
             p.charging = False
             p.charge = 0.0
             p.shot_buffer = p.tackle_buffer = 0.0
+            p.shot_special = None
+            p.special_armed = False
 
         self.goal_fx(self.ball.x, self.ball.y, player_number)
         self.emit("goal", self.ball.x, self.ball.y, player_number)
@@ -4363,7 +5020,7 @@ class Game:
                 cx += gw
             cx += 36
         pygame.draw.line(screen, (58, 181, 221), (W // 2 - 220, 145), (W // 2 + 220, 145), 2)
-        draw_text(screen, self.small_font, "LOCAL SOCCER  -  CHOOSE YOUR GAME MODE",
+        draw_text(screen, self.small_font, "ARCADE SOCCER  -  CHOOSE YOUR GAME MODE",
                   (190, 220, 235), (W // 2, 166))
 
         options = [
@@ -4371,6 +5028,7 @@ class Game:
             ("1 V BOT", "Play against the computer"),
             ("ONLINE PARTY", "Create or join a party over the internet"),
             ("PENALTY SHOOTOUTS", "Pick your shot. Can you beat the keeper?"),
+            ("2V2 SQUAD", "You and an AI teammate vs a rival AI duo"),
         ]
         for i, (name, description) in enumerate(options):
           self.draw_button(
@@ -4667,80 +5325,119 @@ class Game:
         t = self.menu_t
         self.draw_menu_bg()
         host = self.mode == "host"
-        draw_text(screen, self.big_font, "PARTY LOBBY", WHITE, (W // 2, 70))
+        draw_text(screen, self.big_font, "2V2 PARTY LOBBY", WHITE, (W // 2, 48))
 
         if host:
-            draw_text(screen, self.tiny_font, "PARTY CODE - SHARE THIS WITH YOUR FRIEND", (170, 185, 180),
-                      (W // 2, 128), shadow=False)
-            draw_text(screen, self.title_font, self.party_code, GOLD, (W // 2, 172))
-            line = "THAT CODE WORKS ON YOUR WI-FI / LAN."
-            if self.public_state == "loading":
-                line = "LOOKING UP YOUR PUBLIC IP..."
-            elif self.public_state == "error":
-                line = "COULDN'T LOOK UP YOUR PUBLIC IP (OFFLINE?)."
-            elif self.public_code:
-                line = f"INTERNET CODE: {self.public_code}   (FORWARD UDP PORT {NET_PORT} ON YOUR ROUTER)"
-            draw_text(screen, self.tiny_font, line, (220, 235, 220), (W // 2, 218), shadow=False)
+            draw_text(screen, self.tiny_font, "SHARE THIS PARTY CODE", (170, 185, 180),
+                      (W // 2, 94), shadow=False)
+            draw_text(screen, self.title_font, self.party_code, GOLD, (W // 2, 132))
         else:
-            draw_text(screen, self.small_font, f"CONNECTED TO {self.lobby_names[0].upper() or 'HOST'}",
-                      (220, 235, 220), (W // 2, 140), shadow=False)
-            draw_text(screen, self.tiny_font, f"PING {int(self.ping)} MS" if self.ping else "",
-                      (170, 185, 180), (W // 2, 175), shadow=False)
+            draw_text(screen, self.small_font,
+                      f"CONNECTED TO {self.lobby_names[0].upper() or 'HOST'}",
+                      (220, 235, 220), (W // 2, 112), shadow=False)
+            if self.ping:
+                draw_text(screen, self.tiny_font, f"PING {int(self.ping)} MS",
+                          (170, 185, 180), (W // 2, 140), shadow=False)
 
-        # Player cards.
-        names = self.lobby_names
-        ready = [True, self.guest_ready] if host else list(self.lobby_ready)
-        if not host:
-            ready[1] = self.my_ready
-        cards = [(pygame.Rect(W // 2 - 440, 260, 380, 160), BLUE, BLUE_LIGHT, 0),
-                 (pygame.Rect(W // 2 + 60, 260, 380, 160), RED, RED_LIGHT, 1)]
-        for rect, col, light, idx in cards:
-            pygame.draw.rect(screen, UI, rect, border_radius=20)
-            pygame.draw.rect(screen, col, rect, 4, border_radius=20)
-            nm = names[idx]
-            if nm:
-                draw_text(screen, self.font, nm.upper(), light, (rect.centerx, rect.top + 55))
-                tag = "HOST" if idx == 0 else "GUEST"
-                draw_text(screen, self.tiny_font, tag, (170, 185, 180), (rect.centerx, rect.top + 92),
-                          shadow=False)
-                ok = ready[idx]
-                draw_text(screen, self.small_font, "READY" if ok else "NOT READY",
-                          (110, 230, 130) if ok else (190, 150, 90), (rect.centerx, rect.top + 125),
-                          shadow=False)
+        # Build the preview lineup: every unclaimed squad slot is an AI teammate.
+        host_slot, guest_slot = self.online_slot_layout()
+        preview = ["AI TEAMMATE", "AI TEAMMATE", "AI TEAMMATE", "AI TEAMMATE"]
+        if self.squad_mode:
+            preview[host_slot] = (self.name + "  ·  YOU") if host else (self.lobby_names[0] or "HOST")
+            if guest_slot >= 0:
+                preview[guest_slot] = (self.guest_name or self.name) if host else (self.name + "  ·  YOU")
+        else:
+            preview = ["NOT USED", "NOT USED", "NOT USED", "NOT USED"]
+            preview[0] = (self.name + "  ·  YOU") if host else (self.lobby_names[0] or "HOST")
+            preview[1] = (self.guest_name or "GUEST") if host else (self.name + "  ·  YOU")
+
+        card_w = min(545, (W - 150) // 2)
+        card_gap = 44
+        card_left = (W - (2 * card_w + card_gap)) // 2
+        self.lobby_blue_rect = pygame.Rect(card_left, 190, card_w, 220)
+        self.lobby_red_rect = pygame.Rect(card_left + card_w + card_gap, 190, card_w, 220)
+        for team, rect, col, light, title in (
+                (0, self.lobby_blue_rect, BLUE_DARK, BLUE_LIGHT, "BLUE TEAM"),
+                (1, self.lobby_red_rect, RED_DARK, RED_LIGHT, "RED TEAM")):
+            selected = ((self.host_team if host else self.guest_team) == team
+                        if self.squad_mode else team == (0 if host else 1))
+            pygame.draw.rect(screen, (16, 26, 39), rect, border_radius=20)
+            pygame.draw.rect(screen, light if selected else col, rect, 4 if selected else 2,
+                             border_radius=20)
+            draw_text(screen, self.font, title, light, (rect.centerx, rect.top + 36))
+            slots = (0, 2) if team == 0 else (1, 3)
+            for row, slot in enumerate(slots):
+                y = rect.top + 92 + row * 58
+                is_unused = preview[slot] == "NOT USED"
+                is_ai = preview[slot].startswith("AI")
+                badge_col = (110, 120, 130) if is_unused else ((145, 160, 175) if is_ai else light)
+                pygame.draw.circle(screen, badge_col, (rect.left + 50, y), 13)
+                draw_text(screen, self.small_font, f"{row + 1}.", WHITE,
+                          (rect.left + 50, y), shadow=False)
+                draw_text(screen, self.small_font, preview[slot],
+                          (185, 198, 208) if is_ai else light,
+                          (rect.left + 82, y), anchor="midleft", shadow=False)
+                slot_type = "OFF" if is_unused else ("AI" if is_ai else "HUMAN")
+                draw_text(screen, self.tiny_font, slot_type,
+                          (110, 120, 130) if is_unused else ((145, 160, 175) if is_ai else light),
+                          (rect.right - 22, y), anchor="midright", shadow=False)
+            if selected:
+                draw_text(screen, self.tiny_font,
+                          "YOUR TEAM  ·  TAP TO CHANGE" if not host else "YOUR TEAM  ·  TAP TO CHANGE",
+                          GOLD, (rect.centerx, rect.bottom - 17), shadow=False)
             else:
-                dots = "." * (1 + int(t * 0.05) % 3)
-                draw_text(screen, self.small_font, "WAITING FOR PLAYER" + dots, (170, 185, 180),
-                          (rect.centerx, rect.centery), shadow=False)
-        draw_text(screen, self.font, "VS", WHITE, (W // 2, 340))
+                draw_text(screen, self.tiny_font, "TAP TO CHOOSE THIS TEAM",
+                          (170, 185, 195), (rect.centerx, rect.bottom - 17), shadow=False)
 
-        # Action hint.
+        draw_text(screen, self.font, "VS", WHITE, (W // 2, 295))
+        self.lobby_squad_rect = pygame.Rect(W // 2 - 190, 426, 380, 38)
         if host:
-            if self.guest_addr and self.guest_ready:
-                pulse = 0.5 + 0.5 * math.sin(t * 0.12)
-                col = (255, int(190 + 40 * pulse), 55)
-                draw_text(screen, self.menu_font, "SPACE   START MATCH", col, (W // 2, 480))
-            elif self.guest_addr:
-                draw_text(screen, self.small_font, "WAITING FOR THE OTHER PLAYER TO READY UP...",
-                          (205, 215, 210), (W // 2, 480), shadow=False)
-            else:
-                draw_text(screen, self.small_font, "WAITING FOR A FRIEND TO JOIN...",
-                          (205, 215, 210), (W // 2, 480), shadow=False)
+            mode_label = "2V2 HYBRID  ·  AI FILLS OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1"
+            mode_col = GOLD if self.squad_mode else (180, 200, 215)
+            pygame.draw.rect(screen, (14, 28, 43), self.lobby_squad_rect, border_radius=12)
+            pygame.draw.rect(screen, mode_col, self.lobby_squad_rect, 2, border_radius=12)
+            draw_text(screen, self.tiny_font, mode_label + "  ·  TAP / F TO TOGGLE",
+                      mode_col, self.lobby_squad_rect.center, shadow=False)
         else:
-            if self.my_ready:
-                draw_text(screen, self.menu_font, "READY!  WAITING FOR THE HOST TO START", (110, 230, 130),
-                          (W // 2, 480))
-                draw_text(screen, self.tiny_font, "SPACE  UNREADY", (170, 185, 180), (W // 2, 515),
-                          shadow=False)
+            draw_text(screen, self.small_font, "AI AUTOMATICALLY FILLS ANY EMPTY SQUAD SLOTS",
+                      (180, 200, 215), (W // 2, 445), shadow=False)
+
+        if host:
+            if self.guest_addr:
+                ready_text = "GUEST READY — START ONLINE MATCH" if self.guest_ready else "WAITING FOR GUEST TO READY UP..."
+                start_label = "START ONLINE MATCH"
+                start_enabled = self.guest_ready
             else:
-                pulse = 0.5 + 0.5 * math.sin(t * 0.12)
-                draw_text(screen, self.menu_font, "SPACE   READY UP", (255, int(190 + 40 * pulse), 55),
-                          (W // 2, 480))
+                ready_text = "NO GUEST YET — AI WILL FILL ALL THREE OPEN SLOTS"
+                start_label = "PLAY WITH AI"
+                start_enabled = True
+            draw_text(screen, self.tiny_font, ready_text,
+                      (110, 230, 130) if start_enabled else (205, 215, 210),
+                      (W // 2, 478), shadow=False)
+            self.lobby_start_rect = pygame.Rect(W // 2 - 170, 505, 340, 54)
+            pygame.draw.rect(screen, (20, 65, 85) if start_enabled else (42, 48, 54),
+                             self.lobby_start_rect, border_radius=15)
+            pygame.draw.rect(screen, GOLD if start_enabled else (100, 110, 118),
+                             self.lobby_start_rect, 2, border_radius=15)
+            draw_text(screen, self.font, start_label, GOLD if start_enabled else (160, 170, 175),
+                      self.lobby_start_rect.center, shadow=False)
+        else:
+            self.lobby_ready_rect = pygame.Rect(W // 2 - 170, 505, 340, 54)
+            ready_label = "UNREADY" if self.my_ready else "READY UP"
+            pygame.draw.rect(screen, (20, 65, 85) if not self.my_ready else (25, 85, 55),
+                             self.lobby_ready_rect, border_radius=15)
+            pygame.draw.rect(screen, GOLD, self.lobby_ready_rect, 2, border_radius=15)
+            draw_text(screen, self.font, ready_label, GOLD, self.lobby_ready_rect.center, shadow=False)
 
         if self.net_msg:
-            draw_text(screen, self.small_font, self.net_msg, RED_LIGHT, (W // 2, 565))
-        bottom = ("I  LOOK UP INTERNET CODE (CONTACTS API.IPIFY.ORG)      ESC  CLOSE PARTY" if host
-                  else "ESC  LEAVE PARTY")
-        draw_text(screen, self.small_font, bottom, WHITE, (W // 2, H - 36))
+            draw_text(screen, self.small_font, self.net_msg, RED_LIGHT, (W // 2, 574))
+        if host:
+            help_text = ("CLICK BLUE / RED TO CHOOSE YOUR TEAM  ·  F TO TOGGLE 1V1 / 2V2  ·  ESC TO LEAVE"
+                         if self.squad_mode else "F TO ENABLE 2V2 TEAM SELECTION  ·  ESC TO LEAVE")
+        else:
+            help_text = ("CLICK BLUE / RED TO CHOOSE YOUR TEAM  ·  SPACE TO READY  ·  ESC TO LEAVE"
+                         if self.squad_mode else "WAIT FOR HOST TO ENABLE 2V2  ·  SPACE TO READY  ·  ESC TO LEAVE")
+        draw_text(screen, self.tiny_font, help_text, WHITE, (W // 2, H - 24), shadow=False)
 
     def build_field_surface(self):
         surf = pygame.Surface((W, H))
@@ -4835,27 +5532,26 @@ class Game:
                       (panel.centerx, panel.centery), shadow=False)
 
         if online:
-            controls_text = ("MOVE: WASD OR ARROWS  -  SHOOT: E / P (HOLD = POWER)  -  "
-                             "TACKLE: R / L  -  DASH: SHIFT")
+            controls_text = ("MOVE: WASD / ARROWS  -  SHOOT: E / P  -  TACKLE: R / L  -  DASH: SHIFT  -  SKILL: Q")
         elif self.mode == "pvp":
             controls_text = ("BLUE: WASD MOVE - E SHOOT (HOLD = POWER) - R TACKLE - LSHIFT DASH     "
                              "RED: ARROWS - P SHOOT (HOLD) - L TACKLE - RSHIFT DASH")
         else:
-            controls_text = ("YOU: WASD OR ARROWS MOVE - E / P SHOOT (HOLD = POWER) - R / L TACKLE - SHIFT DASH"
+            controls_text = ("MOVE: WASD / ARROWS  -  SHOOT: E / P  -  TACKLE: R / L  -  DASH: SHIFT  -  SKILL: Q"
                              "     RED: BOT")
 
         control_panel = pygame.Rect(W // 2 - 520, H - 58, 1040, 40)
         pygame.draw.rect(screen, UI, control_panel, border_radius=12)
         draw_text(screen, self.tiny_font, controls_text, WHITE, control_panel.center, shadow=False)
 
+        if self.squad_mode:
+            draw_text(screen, self.tiny_font, "2V2 HYBRID  ·  AI FILLS OPEN SLOTS", GOLD,
+                      (W // 2, 13), shadow=False)
         if online:
-            esc = "ESC  LOBBY" if self.mode == "host" else "ESC  LEAVE"
-            draw_text(screen, self.small_font, esc, (200, 205, 205), (18, 13), anchor="topleft",
-                      shadow=False)
             ping = self.ping if self.mode == "client" else self.guest_ping
             if ping:
                 pc = (110, 230, 130) if ping < 80 else (GOLD if ping < 150 else RED_LIGHT)
-                draw_text(screen, self.tiny_font, f"PING {int(ping)} MS", pc, (18, 38),
+                draw_text(screen, self.tiny_font, f"PING {int(ping)} MS", pc, (76, 29),
                           anchor="topleft", shadow=False)
         else:
             draw_text(screen, self.small_font, "ESC  PAUSE", (200, 205, 205), (18, 13), anchor="topleft",
@@ -5193,6 +5889,32 @@ class Game:
 
         apply_state(self.replay_actor1, frame["p1"])
         apply_state(self.replay_actor2, frame["p2"])
+        replay_actors = [self.replay_actor1, self.replay_actor2]
+        if frame.get("p3") and frame.get("p4"):
+            if self.replay_actor3 is None:
+                self.replay_actor3 = Player(frame["p3"]["x"], frame["p3"]["y"],
+                                            self.p3.color, self.p3.dark_color,
+                                            self.p3.light_color, False)
+                self.replay_actor3.accent_color = self.p3.accent_color
+                self.replay_actor3.kit_name = self.p3.kit_name
+                self.replay_actor3.shape = self.p3.shape
+            if self.replay_actor4 is None:
+                self.replay_actor4 = Player(frame["p4"]["x"], frame["p4"]["y"],
+                                            self.p4.color, self.p4.dark_color,
+                                            self.p4.light_color, True)
+                self.replay_actor4.accent_color = self.p4.accent_color
+                self.replay_actor4.kit_name = self.p4.kit_name
+                self.replay_actor4.shape = self.p4.shape
+            apply_state(self.replay_actor3, frame["p3"])
+            apply_state(self.replay_actor4, frame["p4"])
+            replay_actors.extend((self.replay_actor3, self.replay_actor4))
+
+        for keeper, key in ((self.replay_keeper_left, "kl"),
+                            (self.replay_keeper_right, "kr")):
+            ks = frame.get(key)
+            if ks and len(ks) >= 6:
+                keeper.y, keeper.vy, keeper.dive_timer = float(ks[0]), float(ks[1]), float(ks[2])
+                keeper.dive_dir, keeper.save_flash, keeper.animation = map(float, ks[3:6])
 
         self.fx_layer.fill((0, 0, 0, 0))
         trail = frame.get("trail", [])
@@ -5202,9 +5924,12 @@ class Game:
             pygame.draw.circle(self.fx_layer, (238, 247, 255, alpha), (int(tx), int(ty)), rr)
         cv.blit(self.fx_layer, (0, 0))
 
-        for actor in sorted((self.replay_actor1, self.replay_actor2), key=lambda q: q.y):
+        self.replay_keeper_left.draw(cv)
+        self.replay_keeper_right.draw(cv)
+        for actor in sorted(replay_actors, key=lambda q: q.y):
             actor.draw(cv)
-        draw_ball(cv, frame["bx"], frame["by"], 13, frame["br"])
+        draw_ball(cv, frame["bx"], frame["by"] - float(frame.get("bl", 0.0)),
+                  13, frame["br"], ground_y=frame["by"])
 
         # A gentle zoom follows the scoring action, like a TV replay camera.
         progress = idx / max(1, len(frames) - 1)
@@ -5295,7 +6020,14 @@ class Game:
     def draw_virtual_stick(self, side):
         cx, cy = self.joystick_center(side)
         vx, vy = self.joystick_values[side]
-        col = BLUE_LIGHT if side == "p1" else RED_LIGHT
+        if self.mode == "host":
+            local = self.match_players()[int(clamp(self.host_slot, 0, len(self.match_players()) - 1))]
+            col = RED_LIGHT if local.is_p2 else BLUE_LIGHT
+        elif self.mode == "client":
+            local = self.match_players()[int(clamp(self.local_slot, 0, len(self.match_players()) - 1))]
+            col = RED_LIGHT if local.is_p2 else BLUE_LIGHT
+        else:
+            col = BLUE_LIGHT if side == "p1" else RED_LIGHT
         radius = 62
         knob_x = int(cx + vx * 29)
         knob_y = int(cy + vy * 29)
@@ -5328,7 +6060,15 @@ class Game:
 
     def draw_action_button(self, name, rect, side, label):
         active = name in self.touch_held
-        col = BLUE_LIGHT if side == "p1" else RED_LIGHT
+        if self.mode == "host":
+            owner = self.match_players()[int(clamp(self.host_slot, 0, len(self.match_players()) - 1))]
+        elif self.mode == "client":
+            owner = self.match_players()[int(clamp(self.local_slot, 0, len(self.match_players()) - 1))]
+        else:
+            owner = self.p2 if side == "p2" else self.p1
+        if name.endswith("_skill"):
+            active = active or owner.special_armed
+        col = RED_LIGHT if owner.is_p2 else BLUE_LIGHT
         radius = min(rect.w, rect.h) // 2
         cx, cy = rect.center
         pygame.draw.circle(screen, (17, 34, 52), (cx, cy), radius + 7, 2)
@@ -5348,10 +6088,19 @@ class Game:
         self.draw_virtual_stick("p1")
         if self.mode == "pvp":
             self.draw_virtual_stick("p2")
-        labels = {"dash": "DASH", "tackle": "TACKLE", "shoot": "SHOOT"}
+        labels = {"dash": "DASH", "tackle": "TACKLE", "shoot": "SHOOT", "skill": "SKILL"}
         for name, rect in self.touch_rects().items():
             side, action = name.split("_", 1)
-            self.draw_action_button(name, rect, side, labels[action])
+            if self.mode == "host":
+                player = self.match_players()[int(clamp(self.host_slot, 0, len(self.match_players()) - 1))]
+            elif self.mode == "client":
+                player = self.match_players()[int(clamp(self.local_slot, 0, len(self.match_players()) - 1))]
+            else:
+                player = self.p2 if side == "p2" else self.p1
+            label = labels[action]
+            if action == "skill":
+                label = "CHIP" if player.special_kind == "chip" else "CURVE"
+            self.draw_action_button(name, rect, side, label)
 
     def draw(self):
         if self.state == "menu":
@@ -5439,12 +6188,20 @@ class Game:
         for pu in self.powerups:
             draw_powerup(cv, pu["t"], pu["x"], pu["y"], self.ui_t)
 
-        for p in sorted((self.p1, self.p2), key=lambda q: q.y):
+        # Goalkeepers sit in the goal mouths and animate reactions/dive saves.
+        self.keeper_left.draw(cv)
+        self.keeper_right.draw(cv)
+        for p in sorted(self.match_players(), key=lambda q: q.y):
             p.draw(cv)
+            if self.squad_mode:
+                slot = self.match_players().index(p)
+                if slot < len(self.slot_is_human) and not self.slot_is_human[slot]:
+                    draw_text(cv, self.tiny_font, "AI TEAMMATE", (225, 235, 242),
+                              (int(p.x), int(p.y - p.radius - 26)), shadow=True)
 
         # Shot preview: a subtle aiming guide while charging, with a special
         # gold pulse when the shot reaches full power.
-        for shooter in (self.p1, self.p2):
+        for shooter in self.match_players():
             if shooter.charging and shooter.charge > 0.05:
                 fx, fy = normalize(shooter.facing_x, shooter.facing_y,
                                    (-1.0 if shooter.is_p2 else 1.0, 0.0))
@@ -5493,10 +6250,14 @@ class Game:
 
         # Online: name tags and a bobbing "you" arrow.
         if self.mode in ("host", "client"):
-            me = self.p1 if self.mode == "host" else self.p2
-            for idx, p in ((1, self.p1), (2, self.p2)):
-                draw_text(cv, self.tiny_font, self.side_name(idx), BLUE_LIGHT if idx == 1 else RED_LIGHT,
-                          (int(p.x), int(p.y - p.radius - 32)))
+            me_list = self.match_players()
+            my_slot = self.host_slot if self.mode == "host" else self.local_slot
+            me = me_list[int(clamp(my_slot, 0, len(me_list) - 1))]
+            for slot, p in enumerate(me_list):
+                if slot < len(self.slot_names):
+                    name_col = BLUE_LIGHT if not p.is_p2 else RED_LIGHT
+                    draw_text(cv, self.tiny_font, self.slot_names[slot], name_col,
+                              (int(p.x), int(p.y - p.radius - 32)))
             bob = math.sin(self.ui_t * 0.15) * 3
             ax, ay = int(me.x), int(me.y - me.radius - 50 + bob)
             pygame.draw.polygon(cv, GOLD, [(ax - 7, ay - 8), (ax + 7, ay - 8), (ax, ay + 2)])
@@ -5506,6 +6267,7 @@ class Game:
 
         self.draw_hud()
         self.draw_touch_controls()
+        self.draw_game_back_button()
         if self.coin_timer > 0 and self.coin_message and self.state not in ("finished", "replay"):
             toast = pygame.Rect(W // 2 - 200, 112, 400, 42)
             pygame.draw.rect(screen, (18, 28, 35), toast, border_radius=12)
