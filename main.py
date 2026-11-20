@@ -37,8 +37,22 @@ pygame.font.init()
 # DISPLAY / GAME SETTINGS
 # ============================================================
 
-SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 700
+# Mobile browsers use a wide 20:9-style canvas because Hyper Soccer is played
+# in landscape on phones. This keeps the pitch and HUD proportional to the device.
+PHONE_WEB_BUILD = False
+if WEB_BUILD:
+    try:
+        PHONE_WEB_BUILD = bool(platform.window.eval(
+            "(function(){var ua=navigator.userAgent||'';"
+            "var coarse=!!(window.matchMedia&&matchMedia('(pointer:coarse)').matches);"
+            "return /Android.*Mobile|iPhone|iPod|Windows Phone/i.test(ua)||"
+            "(coarse&&Math.min(screen.width||9999,screen.height||9999)<=600);})()"
+        ))
+    except Exception:
+        PHONE_WEB_BUILD = False
+
+SCREEN_WIDTH = 1400 if PHONE_WEB_BUILD else 1200
+SCREEN_HEIGHT = 650 if PHONE_WEB_BUILD else 700
 W, H = SCREEN_WIDTH, SCREEN_HEIGHT
 FPS = 120            # render cap; all physics is delta-time based (60 Hz units)
 MATCH_SECONDS = 90
@@ -50,6 +64,8 @@ MAGIC = "HSOC"
 INTERP_DELAY = 0.105  # seconds behind the host; gives WebSocket jitter room to settle
 
 MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades")
+BACK_NAV_STATES = ("online_menu", "join", "lobby", "settings", "customize", "upgrades",
+                   "penalties", "penalty_finished", "finished", "replay")
 GAME_STATES = ("countdown", "play", "goal", "finished")
 STATE_IDX = {"countdown": 0, "play": 1, "goal": 2, "finished": 3}
 IDX_STATE = {v: k for k, v in STATE_IDX.items()}
@@ -180,20 +196,25 @@ def setup_web_fullscreen_ui():
           button = document.createElement('button');
           button.id = 'hyper-soccer-fullscreen';
           button.type = 'button';
-          button.textContent = '⛶ FULLSCREEN';
+          button.textContent = '⛶';
           button.setAttribute('aria-label', 'Toggle fullscreen');
+          button.title = 'Toggle fullscreen';
           button.style.position = 'fixed';
-          button.style.top = 'max(10px, env(safe-area-inset-top))';
-          button.style.right = 'max(10px, env(safe-area-inset-right))';
+          button.style.top = 'max(9px, env(safe-area-inset-top))';
+          button.style.right = 'max(9px, env(safe-area-inset-right))';
           button.style.zIndex = '2147483647';
-          button.style.padding = '10px 14px';
+          button.style.width = '38px';
+          button.style.height = '38px';
+          button.style.padding = '0';
+          button.style.display = 'grid';
+          button.style.alignItems = 'center';
+          button.style.justifyContent = 'center';
           button.style.border = '1px solid rgba(103,220,255,.85)';
-          button.style.borderRadius = '12px';
-          button.style.background = 'rgba(5,15,30,.82)';
+          button.style.borderRadius = '50%';
+          button.style.background = 'rgba(5,15,30,.78)';
           button.style.color = '#dff8ff';
-          button.style.font = '700 12px system-ui, sans-serif';
-          button.style.letterSpacing = '.08em';
-          button.style.boxShadow = '0 4px 18px rgba(0,0,0,.35)';
+          button.style.font = '700 19px/1 system-ui, sans-serif';
+          button.style.boxShadow = '0 3px 12px rgba(0,0,0,.32)';
           button.style.backdropFilter = 'blur(8px)';
           button.style.webkitBackdropFilter = 'blur(8px)';
           button.style.cursor = 'pointer';
@@ -298,11 +319,15 @@ def setup_web_fullscreen_ui():
           sizeCanvas();
           var portrait = window.innerHeight > window.innerWidth;
           if (rotateOverlay) rotateOverlay.style.display = portrait ? 'flex' : 'none';
-          if (button) button.style.display = (phone && portrait) ? 'none' : 'block';
+          if (button) button.style.display = (phone && portrait) ? 'none' : 'flex';
         }
 
         function updateButton() {
-          if (button) button.textContent = isFullscreen() ? '✕ EXIT FULLSCREEN' : '⛶ FULLSCREEN';
+          if (button) {
+            button.textContent = isFullscreen() ? '×' : '⛶';
+            button.setAttribute('aria-label', isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen');
+            button.title = isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen';
+          }
           updateViewport();
         }
 
@@ -1731,6 +1756,7 @@ class Game:
         self.mode = None            # None / "pvp" / "bot" / "host" / "client"
         self.state = "menu"         # menu / online_menu / join / lobby / countdown / play / goal / paused / finished
         self.prev_state = "play"
+        self.back_button_rect = pygame.Rect(18, 16, 48, 48)
         self.menu_selection = 0
         self.menu_rects = [pygame.Rect(W // 2 - 260, 200 + i * 76, 520, 64) for i in range(4)]
         self.on_rects = [pygame.Rect(W // 2 - 260, 175, 520, 70),
@@ -1784,7 +1810,9 @@ class Game:
             "Move quicker and close down the ball faster",
             "Stronger tackles with a wider steal range",
         )
-        self.upgrade_rects = [pygame.Rect(64 + i * 365, 205, 342, 286) for i in range(3)]
+        upgrade_row_left = (W - (3 * 342 + 2 * 23)) // 2
+        self.upgrade_rects = [pygame.Rect(upgrade_row_left + i * 365, 205, 342, 286)
+                              for i in range(3)]
         self.upgrade_back_rect = pygame.Rect(W // 2 - 105, 548, 210, 48)
         self.upgrades_return_state = "menu"
         self.shop_message = ""
@@ -2875,18 +2903,10 @@ class Game:
                 self.running = False
                 return
 
-            # B toggles background music except when typing a room code or player name.
-            typing = self.state == "join" or (
-                self.state == "online_menu" and self.online_sel == 0
-            )
-            if (
-                event.type == pygame.KEYDOWN
-                and event.key == pygame.K_b
-                and not typing
-            ):
-              self.sound.toggle_music()
-              continue
-
+            # B toggles background music from every screen without changing gameplay controls.
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+                self.sound.toggle_music()
+                continue
 
             # F11 toggles native desktop fullscreen. On the web, the HTML overlay
             # button handles the browser's user-gesture requirement.
@@ -2898,11 +2918,14 @@ class Game:
             st = self.state
             # SDL may deliver touch events without synthesizing mouse clicks on mobile.
             # Convert menu taps to clicks; gameplay keeps native finger events for multitouch.
-            if WEB_BUILD and event.type == pygame.FINGERDOWN and st in (
-                    "menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades"):
+            if WEB_BUILD and event.type == pygame.FINGERDOWN and (st in MENU_STATES or st in BACK_NAV_STATES):
                 event = pygame.event.Event(
                     pygame.MOUSEBUTTONDOWN,
                     {"pos": (int(event.x * W), int(event.y * H)), "button": 1})
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and st in BACK_NAV_STATES and self.back_button_rect.collidepoint(event.pos)):
+                self.navigate_back()
+                continue
             if st == "menu":
                 self.events_menu(event)
             elif st == "online_menu":
@@ -2921,6 +2944,43 @@ class Game:
                 self.events_penalties(event)
             else:
                 self.events_game(event)
+
+    def navigate_back(self):
+        """Handle the persistent top-left back control on secondary screens."""
+        state = self.state
+        self.sound.play("click")
+        if state == "online_menu":
+            self.return_to_menu()
+        elif state in ("join", "lobby"):
+            # Closes the connection cleanly and returns to the online menu.
+            self.leave_party()
+        elif state in ("settings", "customize"):
+            self.state = "menu"
+        elif state == "upgrades":
+            target = getattr(self, "upgrades_return_state", "menu")
+            self.state = target if target in MENU_STATES else "menu"
+        elif state == "replay":
+            self.state = "finished"
+        elif state in ("penalties", "penalty_finished", "finished"):
+            self.return_to_menu()
+
+    def draw_back_button(self):
+        """Small round arrow button matching the game's dark glass UI."""
+        if self.state not in BACK_NAV_STATES:
+            return
+        rect = self.back_button_rect
+        cx, cy = rect.center
+        hover = rect.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.circle(screen, (4, 14, 27), (cx, cy), 25)
+        pygame.draw.circle(screen, (50, 83, 105), (cx, cy), 23, 2)
+        pygame.draw.circle(screen, (18, 34, 49) if not hover else (29, 57, 75),
+                           (cx, cy), 20)
+        edge = GOLD if hover else (115, 205, 229)
+        pygame.draw.circle(screen, edge, (cx, cy), 20, 1)
+        # Left arrow glyph drawn as clean vector strokes for crisp phone rendering.
+        pygame.draw.line(screen, WHITE, (cx + 8, cy), (cx - 7, cy), 3)
+        pygame.draw.line(screen, WHITE, (cx - 7, cy), (cx + 1, cy - 8), 3)
+        pygame.draw.line(screen, WHITE, (cx - 7, cy), (cx + 1, cy + 8), 3)
 
     def menu_choose(self, i):
         if i == 0:
@@ -3092,41 +3152,31 @@ class Game:
         return pygame.Rect(W // 2 - 290, 190 + i * 54, 580, 48)
 
     def events_join(self, event):
-      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-        for i, (addr, _) in enumerate(self.lan_list()):
-          if self.join_row_rect(i).collidepoint(event.pos):
-            self.join_sel = i
-            self.join_text = ""
-            self.try_join(addr)
-      elif event.type == pygame.KEYDOWN:
-        k = event.key
-        if k == pygame.K_ESCAPE:
-          self.net.close()
-          self.joining = None
-          self.state = "online_menu"
-          self.net_msg = ""
-        elif k == pygame.K_UP:
-          self.join_sel = max(0, self.join_sel - 1)
-        elif k == pygame.K_DOWN:
-          self.join_sel = min(
-              max(0, len(self.lan_list()) - 1), self.join_sel + 1
-          )
-        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-          self.join_submit()
-        elif k == pygame.K_BACKSPACE:
-          self.join_text = self.join_text[:-1]
-        elif k == pygame.K_v and (
-            event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
-        ):
-          self.join_text = (self.join_text + clipboard_text().strip())[:30]
-        elif len(self.join_text) < 30:
-          ch = event.unicode if len(event.unicode) == 1 else ""
-          if not ch:
-            name = pygame.key.name(k)
-            if len(name) == 1 and name.isalnum():
-              ch = name.upper() if (event.mod & pygame.KMOD_SHIFT) else name
-          if ch and ch.isprintable():
-            self.join_text += ch
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for i, (addr, _) in enumerate(self.lan_list()):
+                if self.join_row_rect(i).collidepoint(event.pos):
+                    self.join_sel = i
+                    self.join_text = ""
+                    self.try_join(addr)
+        elif event.type == pygame.KEYDOWN:
+            k = event.key
+            if k == pygame.K_ESCAPE:
+                self.net.close()
+                self.joining = None
+                self.state = "online_menu"
+                self.net_msg = ""
+            elif k == pygame.K_UP:
+                self.join_sel = max(0, self.join_sel - 1)
+            elif k == pygame.K_DOWN:
+                self.join_sel = min(max(0, len(self.lan_list()) - 1), self.join_sel + 1)
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.join_submit()
+            elif k == pygame.K_BACKSPACE:
+                self.join_text = self.join_text[:-1]
+            elif k == pygame.K_v and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
+                self.join_text = (self.join_text + clipboard_text().strip())[:30]
+            elif event.unicode and event.unicode.isprintable() and len(self.join_text) < 30:
+                self.join_text += event.unicode
 
     def events_lobby(self, event):
         if event.type != pygame.KEYDOWN:
@@ -4402,12 +4452,16 @@ class Game:
                 self.sound.play("click")
 
     def kit_card_rects(self):
-        # Twelve compact colour swatches per player, all visible without scrolling.
-        return [[pygame.Rect(110 + i * 82, 245 + side * 80, 72, 68)
+        # Twelve compact colour swatches per player, centred at every canvas width.
+        row_width = (len(KITS) - 1) * 82 + 72
+        left = (W - row_width) // 2
+        return [[pygame.Rect(left + i * 82, 245 + side * 80, 72, 68)
                  for i in range(len(KITS))] for side in range(2)]
 
     def shape_card_rects(self):
-        return [[pygame.Rect(270 + i * 116, 400 + side * 42, 108, 34)
+        row_width = (len(self.shape_options) - 1) * 116 + 108
+        left = (W - row_width) // 2
+        return [[pygame.Rect(left + i * 116, 400 + side * 42, 108, 34)
                  for i in range(len(self.shape_options))] for side in range(2)]
 
     def draw_customize(self):
@@ -5307,46 +5361,56 @@ class Game:
             return
         if self.state == "online_menu":
             self.draw_online_menu()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "join":
             self.draw_join()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "lobby":
             self.draw_lobby()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "settings":
             self.draw_settings()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "customize":
             self.draw_customize()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "upgrades":
             self.draw_upgrade_shop()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state in ("penalties", "penalty_finished"):
             self.draw_penalties()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "finished":
             self.draw_match_highlights()
+            self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
             return
         if self.state == "replay":
             self.draw_replay_viewer()
+            self.draw_back_button()
+            pygame.display.flip()
             return
 
         if self.field_surface is None:
@@ -5513,4 +5577,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
