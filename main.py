@@ -86,9 +86,10 @@ BOT_LEVELS = [
     {"name": "NORMAL", "lull": 0.0045, "lull_len": (18, 38), "think": (20, 34), "mag": 0.57,
      "err": 63, "aim": 132, "shoot": 0.008, "shoot_x": 530, "charge": (0.0, 0.28),
      "tackle": 0.020, "tk_range": 59, "fumble": 0.0022, "dash": False, "seek_pu": False},
-    {"name": "HARD", "lull": 0.0010, "lull_len": (8, 18), "think": (13, 23), "mag": 0.76,
-     "err": 42, "aim": 108, "shoot": 0.019, "shoot_x": 660, "charge": (0.05, 0.48),
-     "tackle": 0.052, "tk_range": 68, "fumble": 0.0012, "dash": False, "seek_pu": False},
+    # HARD: more alert and accurate, but still beatable (no constant sprinting or perfect aim).
+    {"name": "HARD", "lull": 0.0007, "lull_len": (7, 15), "think": (10, 18), "mag": 0.81,
+     "err": 36, "aim": 94, "shoot": 0.022, "shoot_x": 685, "charge": (0.08, 0.54),
+     "tackle": 0.060, "tk_range": 72, "fumble": 0.0010, "dash": False, "seek_pu": False},
 ]
 
 # Desktop builds start in fullscreen. Press F11 to switch between fullscreen and
@@ -6348,3 +6349,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
