@@ -3267,7 +3267,75 @@ class Game:
             player.special_armed = False
             player.shot_buffer = 9.0
 
+    def sync_mobile_join_field(self):
+        """Show a real HTML text field over the join box so phone keyboards work."""
+        if not WEB_BUILD:
+            return
+        try:
+            if self.state == "join":
+                js = r"""
+                (function() {
+                  var canvas = document.querySelector('canvas');
+                  if (!canvas) return JSON.stringify({value: '', submit: false});
+                  var input = document.getElementById('hs-mobile-join-code');
+                  if (!input) {
+                    input = document.createElement('input');
+                    input.id = 'hs-mobile-join-code';
+                    input.type = 'text';
+                    input.autocomplete = 'off';
+                    input.autocapitalize = 'characters';
+                    input.spellcheck = false;
+                    input.maxLength = 30;
+                    input.placeholder = 'Tap here and type party code';
+                    input.setAttribute('aria-label', 'Party code or IP address');
+                    input.style.cssText = 'position:fixed;z-index:9999;box-sizing:border-box;' +
+                      'border:2px solid #e8bd42;border-radius:10px;background:rgba(15,25,38,.96);' +
+                      'color:white;font: bold 18px sans-serif;text-align:center;outline:none;' +
+                      'padding:8px 12px;display:block;touch-action:auto;';
+                    input.addEventListener('input', function() {
+                      window._hs_join_value = input.value;
+                    });
+                    input.addEventListener('keydown', function(e) {
+                      e.stopPropagation();
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        window._hs_join_submit = true;
+                        input.blur();
+                      }
+                    });
+                    document.body.appendChild(input);
+                    window._hs_join_value = '';
+                    window._hs_join_submit = false;
+                  }
+                  var r = canvas.getBoundingClientRect();
+                  var logicalW = canvas.width || 1200;
+                  var logicalH = canvas.height || 700;
+                  var sx = r.width / logicalW;
+                  var sy = r.height / logicalH;
+                  input.style.left = (r.left + (logicalW/2 - 310) * sx) + 'px';
+                  input.style.top = (r.top + 440 * sy) + 'px';
+                  input.style.width = (620 * sx) + 'px';
+                  input.style.height = (70 * sy) + 'px';
+                  input.style.fontSize = Math.max(14, 18 * Math.min(sx, sy)) + 'px';
+                  if (typeof window._hs_join_value !== 'string') window._hs_join_value = input.value;
+                  return JSON.stringify({value: input.value, submit: !!window._hs_join_submit});
+                })()
+                """
+                data = json.loads(str(platform.window.eval(js)))
+                self.join_text = data.get("value", "")[:30]
+                if data.get("submit"):
+                    platform.window.eval("window._hs_join_submit = false;")
+                    self.join_submit()
+            else:
+                platform.window.eval(
+                    "(function(){var e=document.getElementById('hs-mobile-join-code');"
+                    "if(e)e.remove();window._hs_join_value='';window._hs_join_submit=false;})()"
+                )
+        except Exception:
+            pass
+
     def handle_events(self):
+        self.sync_mobile_join_field()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -4143,14 +4211,14 @@ class Game:
                 "p2_skill": circle(W - 335, H - 65, 34),
             }
         else:
-            # One-human modes (1vBot and online 1v1): keep the entire mobile
-            # controller on the right.  The joystick sits at the outer edge,
-            # while the action buttons form two neat columns to its left.
+            # One-human modes (1vBot and online 1v1): joystick stays on the
+            # right edge; action buttons sit on the left. Local 2-player
+            # keeps its existing split-controller layout.
             rects = {
-                "p1_dash": circle(W - 390, H - 220, 37),
-                "p1_tackle": circle(W - 390, H - 125, 37),
-                "p1_shoot": circle(W - 260, H - 170, 51),
-                "p1_skill": circle(W - 260, H - 65, 34),
+                "p1_dash": circle(390, H - 220, 37),
+                "p1_tackle": circle(390, H - 125, 37),
+                "p1_shoot": circle(260, H - 170, 51),
+                "p1_skill": circle(260, H - 65, 34),
             }
         return rects
 
@@ -5319,7 +5387,7 @@ class Game:
         box = pygame.Rect(W // 2 - 310, 440, 620, 70)
         pygame.draw.rect(screen, UI_LIGHT, box, border_radius=16)
         pygame.draw.rect(screen, GOLD if self.join_text else (90, 100, 105), box, 3, border_radius=16)
-        draw_text(screen, self.tiny_font, "OR TYPE A PARTY CODE / IP ADDRESS  (CTRL+V TO PASTE)",
+        draw_text(screen, self.tiny_font, "TAP TO TYPE A PARTY CODE / IP ADDRESS" if WEB_BUILD else "OR TYPE A PARTY CODE / IP ADDRESS  (CTRL+V TO PASTE)",
                   (170, 185, 180), (box.centerx, box.top + 16), shadow=False)
         caret = "|" if int(t * 0.08) % 2 == 0 else ""
         shown = (self.join_text + caret) if self.join_text or caret else ""
