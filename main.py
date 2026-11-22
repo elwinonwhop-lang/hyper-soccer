@@ -11,6 +11,19 @@ from array import array
 WEB_BUILD = sys.platform == "emscripten"
 RELAY_URL = "wss://hyper-soccer-relay-1.onrender.com"
 
+if WEB_BUILD:import asyncio
+import pygame
+import sys
+import math
+import random
+import json
+import os
+import time
+from array import array
+
+WEB_BUILD = sys.platform == "emscripten"
+RELAY_URL = "wss://hyper-soccer-relay-1.onrender.com"
+
 if WEB_BUILD:
   import platform
 else:
@@ -6582,3 +6595,4 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
+ 
