@@ -1977,6 +1977,15 @@ class Game:
         self.touch_pointer_map = {}
         self.joystick_values = {"p1": (0.0, 0.0), "p2": (0.0, 0.0)}
         self.touch_controls_enabled = self.detect_touch_device()
+        self.right_hand_control = False  # False: stick left / actions right; True: stick right / actions left
+        self.game_settings_open = False
+        self.name_editing = False
+        self.name_edit_value = ""
+        self.game_settings_button = pygame.Rect(W - 64, 14, 46, 46)
+        self.game_settings_panel = pygame.Rect(W // 2 - 230, H // 2 - 150, 460, 300)
+        self.game_settings_right_rect = pygame.Rect(W // 2 - 180, H // 2 - 62, 360, 58)
+        self.game_settings_name_rect = pygame.Rect(W // 2 - 180, H // 2 + 12, 360, 58)
+        self.game_settings_close_rect = pygame.Rect(W // 2 - 95, H // 2 + 88, 190, 42)
         self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 0}
         self.sound = Sound()
         self.profile = self.load_profile()
@@ -2135,9 +2144,10 @@ class Game:
 
         Local 2-player mode keeps one controller on each side of the screen.
         """
-        if side == "p1" and self.mode in ("bot", "host", "client"):
-            return (W - 100, H - 142)
-        return (96, H - 142) if side == "p1" else (W - 96, H - 142)
+        if self.mode == "pvp":
+            return (96, H - 142) if side == "p1" else (W - 96, H - 142)
+        stick_right = bool(self.right_hand_control)
+        return ((W - 100, H - 142) if stick_right else (100, H - 142))
 
     def update_joystick(self, side, pos):
         cx, cy = self.joystick_center(side)
@@ -2784,11 +2794,17 @@ class Game:
                     if t == "cl":
                         self.guest_ready = bool(msg.get("r"))
                         self.guest_team = int(clamp(int(msg.get("team", self.guest_team)), 0, 1))
+                        if msg.get("name"):
+                            self.guest_name = clean_name(msg.get("name"), self.guest_name or "GUEST")
+                            self.lobby_names[1] = self.guest_name
                         self.refresh_online_slots()
                     elif t == "back":
                         # Keep the guest connected and return both players to the party lobby.
                         self.host_to_lobby("The other player returned to the lobby")
                     elif t == "in":
+                        if msg.get("name"):
+                            self.guest_name = clean_name(msg.get("name"), self.guest_name or "GUEST")
+                            self.refresh_online_slots()
                         self.net_in = {
                             "dx": clamp(float(msg.get("dx", 0)), -1, 1),
                             "dy": clamp(float(msg.get("dy", 0)), -1, 1),
@@ -2921,7 +2937,7 @@ class Game:
             if now - self.lobby_send_t > 0.25:
               self.lobby_send_t = now
               net.send({"t": "cl", "r": int(self.my_ready),
-                        "team": int(self.guest_team)}, self.host_addr)
+                        "team": int(self.guest_team), "name": self.name}, self.host_addr)
           elif self.state in GAME_STATES:
             self.client_send_input(now)
 
@@ -2933,7 +2949,7 @@ class Game:
         dx, dy, dash = self.combined_input(pygame.key.get_pressed())
         self.net.send({"t": "in", "dx": dx, "dy": dy, "d": int(bool(dash)),
                        "sh": int(self.c_shoot), "tk": self.c_tackle, "sp": self.c_special,
-                       "ts": now, "pg": int(self.ping)}, self.host_addr)
+                       "name": self.name, "ts": now, "pg": int(self.ping)}, self.host_addr)
 
     def host_send_snapshot(self, now):
         if now - self.snap_send_t < 1.0 / 65.0:
@@ -3272,7 +3288,48 @@ class Game:
         if not WEB_BUILD:
             return
         try:
-            if self.state == "join":
+            if self.name_editing:
+                js_name = r"""
+                (function() {
+                  var canvas = document.querySelector('canvas');
+                  if (!canvas) return JSON.stringify({value: '', submit: false});
+                  var input = document.getElementById('hs-mobile-player-name');
+                  if (!input) {
+                    input = document.createElement('input');
+                    input.id = 'hs-mobile-player-name';
+                    input.type = 'text';
+                    input.autocomplete = 'nickname';
+                    input.maxLength = 12;
+                    input.placeholder = 'Type your player name';
+                    input.style.cssText = 'position:fixed;z-index:10000;box-sizing:border-box;' +
+                      'border:2px solid #e8bd42;border-radius:12px;background:#101e30;' +
+                      'color:white;font:bold 18px sans-serif;text-align:center;padding:10px;' +
+                      'outline:none;touch-action:auto;';
+                    input.addEventListener('input', function(){ window._hs_name_value = input.value; });
+                    input.addEventListener('keydown', function(e) {
+                      e.stopPropagation();
+                      if (e.key === 'Enter') { e.preventDefault(); window._hs_name_submit = true; input.blur(); }
+                    });
+                    document.body.appendChild(input);
+                    window._hs_name_value = '';
+                    window._hs_name_submit = false;
+                    input.focus();
+                  }
+                  var r = canvas.getBoundingClientRect(), lw = canvas.width || 1200, lh = canvas.height || 700;
+                  var sx = r.width/lw, sy = r.height/lh;
+                  input.style.left = (r.left + (lw/2-190)*sx) + 'px';
+                  input.style.top = (r.top + (lh/2+70)*sy) + 'px';
+                  input.style.width = (380*sx) + 'px';
+                  input.style.height = (54*sy) + 'px';
+                  return JSON.stringify({value: input.value, submit: !!window._hs_name_submit});
+                })()
+                """
+                data = json.loads(str(platform.window.eval(js_name)))
+                self.name_edit_value = data.get("value", "")[:12]
+                if data.get("submit"):
+                    platform.window.eval("window._hs_name_submit = false;")
+                    self.commit_online_name()
+            elif self.state == "join":
                 js = r"""
                 (function() {
                   var canvas = document.querySelector('canvas');
@@ -3328,7 +3385,9 @@ class Game:
                     self.join_submit()
             else:
                 platform.window.eval(
-                    "(function(){var e=document.getElementById('hs-mobile-join-code');"
+                    "(function(){var n=document.getElementById('hs-mobile-player-name');if(n)n.remove();"
+                    "window._hs_name_value='';window._hs_name_submit=false;"
+                    "var e=document.getElementById('hs-mobile-join-code');"
                     "if(e)e.remove();window._hs_join_value='';window._hs_join_submit=false;})()"
                 )
         except Exception:
@@ -3413,6 +3472,48 @@ class Game:
             self.client_to_lobby()
         else:
             self.return_to_menu()
+
+    def draw_game_settings_button(self):
+        if self.state not in ("countdown", "play", "goal", "paused"):
+            return
+        r = self.game_settings_button
+        pygame.draw.circle(screen, (5, 16, 27), r.center, 24)
+        pygame.draw.circle(screen, (100, 150, 180), r.center, 22, 2)
+        pygame.draw.circle(screen, (20, 39, 55), r.center, 18)
+        # Simple gear glyph.
+        pygame.draw.circle(screen, GOLD, r.center, 8, 3)
+        pygame.draw.circle(screen, GOLD, r.center, 3)
+        for ang in range(0, 360, 45):
+            a = math.radians(ang)
+            p1 = (int(r.centerx + math.cos(a) * 10), int(r.centery + math.sin(a) * 10))
+            p2 = (int(r.centerx + math.cos(a) * 15), int(r.centery + math.sin(a) * 15))
+            pygame.draw.line(screen, GOLD, p1, p2, 3)
+
+    def draw_game_settings_overlay(self):
+        if not self.game_settings_open:
+            return
+        shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 175))
+        screen.blit(shade, (0, 0))
+        p = self.game_settings_panel
+        pygame.draw.rect(screen, (12, 24, 38), p, border_radius=22)
+        pygame.draw.rect(screen, (93, 170, 205), p, 2, border_radius=22)
+        draw_text(screen, self.font, "MATCH SETTINGS", WHITE, (p.centerx, p.top + 34))
+        r = self.game_settings_right_rect
+        pygame.draw.rect(screen, (27, 48, 65), r, border_radius=12)
+        pygame.draw.rect(screen, GOLD, r, 2, border_radius=12)
+        hand = "RIGHT HAND  ·  STICK RIGHT" if self.right_hand_control else "LEFT HAND  ·  STICK LEFT"
+        draw_text(screen, self.small_font, hand, GOLD, r.center, shadow=False)
+        nr = self.game_settings_name_rect
+        pygame.draw.rect(screen, (27, 48, 65), nr, border_radius=12)
+        pygame.draw.rect(screen, (93, 170, 205), nr, 2, border_radius=12)
+        name_label = ("NAME: " + (self.name_edit_value if self.name_editing else self.name)) if self.mode in ("host", "client") else "ONLINE NAME (ONLINE ONLY)"
+        draw_text(screen, self.small_font, name_label[:34], WHITE, nr.center, shadow=False)
+        cr = self.game_settings_close_rect
+        pygame.draw.rect(screen, (32, 75, 92), cr, border_radius=10)
+        draw_text(screen, self.small_font, "DONE", WHITE, cr.center, shadow=False)
+        draw_text(screen, self.tiny_font, "Tap the name row to edit · Enter to save",
+                  (175, 195, 210), (p.centerx, p.bottom - 8), shadow=False)
 
     def draw_game_back_button(self):
         """Compact top-left back arrow shown over live gameplay."""
@@ -3729,6 +3830,42 @@ class Game:
 
     def events_game(self, event):
 
+        # Live match settings stay in the match; they never reset or disconnect it.
+        if self.game_settings_open:
+            if WEB_BUILD and event.type == pygame.FINGERDOWN:
+                event = pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                    {"pos": (int(event.x * W), int(event.y * H)), "button": 1})
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.game_settings_right_rect.collidepoint(event.pos):
+                    self.right_hand_control = not self.right_hand_control
+                    self.joystick_values = {"p1": (0.0, 0.0), "p2": (0.0, 0.0)}
+                elif self.game_settings_name_rect.collidepoint(event.pos):
+                    if self.mode in ("host", "client"):
+                        self.name_editing = True
+                        self.name_edit_value = self.name
+                elif self.game_settings_close_rect.collidepoint(event.pos):
+                    self.game_settings_open = False
+                elif not self.game_settings_panel.collidepoint(event.pos):
+                    self.game_settings_open = False
+                return
+            if event.type == pygame.KEYDOWN:
+                if self.name_editing and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.commit_online_name()
+                elif event.key == pygame.K_ESCAPE:
+                    self.name_editing = False
+                    self.game_settings_open = False
+                elif self.name_editing and event.key == pygame.K_BACKSPACE:
+                    self.name_edit_value = self.name_edit_value[:-1]
+                elif self.name_editing and event.unicode and event.unicode.isprintable() and len(self.name_edit_value) < 12:
+                    self.name_edit_value += event.unicode
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.game_settings_open = False
+                return
+            if event.type == pygame.TEXTINPUT and self.name_editing:
+                self.name_edit_value = clean_name(self.name_edit_value + event.text)
+                return
+            return
+
         # The in-match back arrow is checked before joystick/action hitboxes so a
         # tap in the top-left corner always navigates back instead of moving.
         if self.state in ("countdown", "play", "goal", "paused"):
@@ -3743,6 +3880,10 @@ class Game:
                     return
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.state in ("play", "countdown", "goal") and self.game_settings_button.collidepoint(event.pos):
+                self.game_settings_open = True
+                self.name_editing = False
+                return
             if self.state == "play" and self.handle_touch_pointer("mouse", event.pos, True):
                 return
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -3753,6 +3894,10 @@ class Game:
                 return
         elif event.type == pygame.FINGERDOWN:
             pos = (int(event.x * W), int(event.y * H))
+            if self.state in ("play", "countdown", "goal") and self.game_settings_button.collidepoint(pos):
+                self.game_settings_open = True
+                self.name_editing = False
+                return
             if self.state == "play" and self.handle_touch_pointer(("finger", event.finger_id), pos, True):
                 return
         elif event.type == pygame.FINGERMOTION:
@@ -4149,6 +4294,18 @@ class Game:
                     second.clamp_to_field()
 
 
+    def commit_online_name(self):
+        new_name = clean_name(self.name_edit_value, self.name)
+        self.name = new_name
+        self.name_editing = False
+        if self.mode == "host":
+            self.lobby_names[0] = new_name
+            self.refresh_online_slots()
+        elif self.mode == "client" and self.host_addr:
+            self.net.send({"t": "cl", "r": int(self.my_ready),
+                           "team": int(self.guest_team), "name": new_name}, self.host_addr)
+        self.sound.play("menuok")
+
     def touch_down(self, name):
         if name in self.touch_held:
             return
@@ -4214,11 +4371,16 @@ class Game:
             # One-human modes (1vBot and online 1v1): joystick stays on the
             # right edge; action buttons sit on the left. Local 2-player
             # keeps its existing split-controller layout.
+            # One-human layout mirrors cleanly when the dominant hand changes.
+            if self.right_hand_control:
+                dash_x, shoot_x = 390, 260
+            else:
+                dash_x, shoot_x = W - 390, W - 260
             rects = {
-                "p1_dash": circle(390, H - 220, 37),
-                "p1_tackle": circle(390, H - 125, 37),
-                "p1_shoot": circle(260, H - 170, 51),
-                "p1_skill": circle(260, H - 65, 34),
+                "p1_dash": circle(dash_x, H - 220, 37),
+                "p1_tackle": circle(dash_x, H - 125, 37),
+                "p1_shoot": circle(shoot_x, H - 170, 51),
+                "p1_skill": circle(shoot_x, H - 65, 34),
             }
         return rects
 
@@ -6346,6 +6508,8 @@ class Game:
         self.draw_hud()
         self.draw_touch_controls()
         self.draw_game_back_button()
+        self.draw_game_settings_button()
+        self.draw_game_settings_overlay()
         if self.coin_timer > 0 and self.coin_message and self.state not in ("finished", "replay"):
             toast = pygame.Rect(W // 2 - 200, 112, 400, 42)
             pygame.draw.rect(screen, (18, 28, 35), toast, border_radius=12)
