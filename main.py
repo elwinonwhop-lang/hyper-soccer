@@ -3378,8 +3378,8 @@ class Game:
                     window._hs_join_submit = false;
                   }
                   var r = canvas.getBoundingClientRect();
-                  var logicalW = canvas.width || 1200;
-                  var logicalH = canvas.height || 700;
+                  var logicalW = {W};
+                  var logicalH = {H};
                   var sx = r.width / logicalW;
                   var sy = r.height / logicalH;
                   input.style.left = (r.left + (logicalW/2 - 310) * sx) + 'px';
@@ -3414,9 +3414,19 @@ class Game:
                 return
 
             # B toggles background music from every screen without changing gameplay controls.
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
-                self.sound.toggle_music()
-                continue
+            # B toggles background music except when typing a room code or player name.
+            typing = (
+                self.state == "join"
+                or self.name_editing
+                or (self.state == "online_menu" and self.online_sel == 0)
+            )
+            if (
+                event.type == pygame.KEYDOWN
+                and event.key == pygame.K_b
+                and not typing
+            ):
+              self.sound.toggle_music()
+              continue
 
             # F11 toggles native desktop fullscreen. On the web, the HTML overlay
             # button handles the browser's user-gesture requirement.
@@ -3701,13 +3711,23 @@ class Game:
                 if r.collidepoint(event.pos):
                     self.online_sel = i
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for i, r in enumerate(self.on_rects):
-                if r.collidepoint(event.pos):
-                    self.online_sel = i
-                    if i == 1:
-                        self.start_hosting()
-                    elif i == 2:
-                        self.open_join()
+          for i, r in enumerate(self.on_rects):
+            if r.collidepoint(event.pos):
+              self.online_sel = i
+              if i == 0 and WEB_BUILD:
+                try:
+                  entered = platform.window.prompt(
+                      "Enter your player name (max 12 chars):", self.name
+                  )
+                  if entered is not None:
+                    self.name = clean_name(entered, self.name)
+                except Exception:
+                  pass
+              elif i == 1:
+                self.start_hosting()
+              elif i == 2:
+                self.open_join()
+
         elif event.type == pygame.KEYDOWN:
             k = event.key
             if k == pygame.K_ESCAPE:
@@ -3733,76 +3753,111 @@ class Game:
         return pygame.Rect(W // 2 - 290, 190 + i * 54, 580, 48)
 
     def events_join(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for i, (addr, _) in enumerate(self.lan_list()):
-                if self.join_row_rect(i).collidepoint(event.pos):
-                    self.join_sel = i
-                    self.join_text = ""
-                    self.try_join(addr)
-        elif event.type == pygame.KEYDOWN:
-            k = event.key
-            if k == pygame.K_ESCAPE:
-                self.net.close()
-                self.joining = None
-                self.state = "online_menu"
-                self.net_msg = ""
-            elif k == pygame.K_UP:
-                self.join_sel = max(0, self.join_sel - 1)
-            elif k == pygame.K_DOWN:
-                self.join_sel = min(max(0, len(self.lan_list()) - 1), self.join_sel + 1)
-            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        box = pygame.Rect(W // 2 - 310, 440, 620, 70)
+        if WEB_BUILD and box.collidepoint(event.pos):
+          try:
+            entered = platform.window.prompt(
+                "Enter the 5-letter party code:", self.join_text
+            )
+            if entered is not None:
+              self.join_text = str(entered).strip().upper()[:30]
+              if len(self.join_text) >= 4:
                 self.join_submit()
-            elif k == pygame.K_BACKSPACE:
-                self.join_text = self.join_text[:-1]
-            elif k == pygame.K_v and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
-                self.join_text = (self.join_text + clipboard_text().strip())[:30]
-            elif event.unicode and event.unicode.isprintable() and len(self.join_text) < 30:
-                self.join_text += event.unicode
+          except Exception:
+            pass
+          return
+        for i, (addr, _) in enumerate(self.lan_list()):
+          if self.join_row_rect(i).collidepoint(event.pos):
+            self.join_sel = i
+            self.join_text = ""
+            self.try_join(addr)
+      elif event.type == pygame.KEYDOWN:
+        k = event.key
+        if k == pygame.K_ESCAPE:
+          self.net.close()
+          self.joining = None
+          self.state = "online_menu"
+          self.net_msg = ""
+        elif k == pygame.K_UP:
+          self.join_sel = max(0, self.join_sel - 1)
+        elif k == pygame.K_DOWN:
+          self.join_sel = min(
+              max(0, len(self.lan_list()) - 1), self.join_sel + 1
+          )
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+          self.join_submit()
+        elif k == pygame.K_BACKSPACE:
+          self.join_text = self.join_text[:-1]
+        elif k == pygame.K_v and (
+            event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
+        ):
+          self.join_text = (self.join_text + clipboard_text().strip())[:30]
+        elif len(self.join_text) < 30:
+          ch = event.unicode if len(event.unicode) == 1 else ""
+          if not ch:
+            name = pygame.key.name(k)
+            if len(name) == 1 and name.isalnum():
+              ch = name.upper() if (event.mod & pygame.KMOD_SHIFT) else name
+          if ch and ch.isprintable():
+            self.join_text += ch
 
     def events_lobby(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if getattr(self, "lobby_blue_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
-                if self.squad_mode:
-                    if self.mode == "host":
-                        self.host_team = 0
-                    else:
-                        self.guest_team = 0
-                        self.my_ready = False
-                        self.team_change_pending = True
-                    self.refresh_online_slots()
-                    self.lobby_send_t = -10.0
-                    self.sound.play("menuok")
-                return
-            if getattr(self, "lobby_red_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
-                if self.squad_mode:
-                    if self.mode == "host":
-                        self.host_team = 1
-                    else:
-                        self.guest_team = 1
-                        self.my_ready = False
-                        self.team_change_pending = True
-                    self.refresh_online_slots()
-                    self.lobby_send_t = -10.0
-                    self.sound.play("menuok")
-                return
-            if self.mode == "host" and getattr(self, "lobby_squad_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
-                self.squad_mode = not self.squad_mode
-                self.refresh_online_slots()
-                self.net_msg = "AI WILL FILL OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1 ENABLED"
-                self.lobby_send_t = -10.0
-                self.sound.play("menuok")
-                return
-            if self.mode == "host" and getattr(self, "lobby_start_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
-                self.host_start_match()
-                return
-            if self.mode == "client" and getattr(self, "lobby_ready_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(event.pos):
-                self.my_ready = not self.my_ready
-                self.lobby_send_t = -10.0
-                self.sound.play("menuok")
-                return
-            return
-        if event.type != pygame.KEYDOWN:
-            return
+      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        # Larger tap area for Ready Up / Start Match on phones
+        start_hit = pygame.Rect(W // 2 - 200, 495, 400, 74)
+        if self.mode == "host" and start_hit.collidepoint(event.pos):
+          self.host_start_match()
+          return
+        if self.mode == "client" and start_hit.collidepoint(event.pos):
+          self.my_ready = not self.my_ready
+          self.lobby_send_t = -10.0
+          self.sound.play("menuok")
+          return
+        if getattr(
+            self, "lobby_blue_rect", pygame.Rect(0, 0, 0, 0)
+        ).collidepoint(event.pos):
+          if self.squad_mode:
+            if self.mode == "host":
+              self.host_team = 0
+            else:
+              self.guest_team = 0
+              self.my_ready = False
+              self.team_change_pending = True
+            self.refresh_online_slots()
+            self.lobby_send_t = -10.0
+            self.sound.play("menuok")
+          return
+        if getattr(
+            self, "lobby_red_rect", pygame.Rect(0, 0, 0, 0)
+        ).collidepoint(event.pos):
+          if self.squad_mode:
+            if self.mode == "host":
+              self.host_team = 1
+            else:
+              self.guest_team = 1
+              self.my_ready = False
+              self.team_change_pending = True
+            self.refresh_online_slots()
+            self.lobby_send_t = -10.0
+            self.sound.play("menuok")
+          return
+        if self.mode == "host" and getattr(
+            self, "lobby_squad_rect", pygame.Rect(0, 0, 0, 0)
+        ).collidepoint(event.pos):
+          self.squad_mode = not self.squad_mode
+          self.refresh_online_slots()
+          self.net_msg = (
+              "AI WILL FILL OPEN SLOTS"
+              if self.squad_mode
+              else "CLASSIC 1V1 ENABLED"
+          )
+          self.lobby_send_t = -10.0
+          self.sound.play("menuok")
+          return
+        return
+      if event.type != pygame.KEYDOWN:
+        return
         k = event.key
         if k == pygame.K_f and self.mode == "host":
             self.squad_mode = not self.squad_mode
