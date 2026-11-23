@@ -3297,12 +3297,12 @@ class Game:
             player.shot_buffer = 9.0
 
     def sync_mobile_join_field(self):
-        """Show a real HTML text field over the join box so phone keyboards work."""
-        if not WEB_BUILD:
-            return
-        try:
-            if self.name_editing:
-                js_name = r"""
+      """Show a real HTML text field only when editing player name on mobile."""
+      if not WEB_BUILD:
+        return
+      try:
+        if self.name_editing:
+          js_name = r"""
                 (function() {
                   var canvas = document.querySelector('canvas');
                   if (!canvas) return JSON.stringify({value: '', submit: false});
@@ -3337,74 +3337,21 @@ class Game:
                   return JSON.stringify({value: input.value, submit: !!window._hs_name_submit});
                 })()
                 """
-                data = json.loads(str(platform.window.eval(js_name)))
-                self.name_edit_value = data.get("value", "")[:12]
-                if data.get("submit"):
-                    platform.window.eval("window._hs_name_submit = false;")
-                    self.commit_online_name()
-            elif self.state == "join":
-                js = r"""
-                (function() {
-                  var canvas = document.querySelector('canvas');
-                  if (!canvas) return JSON.stringify({value: '', submit: false});
-                  var input = document.getElementById('hs-mobile-join-code');
-                  if (!input) {
-                    input = document.createElement('input');
-                    input.id = 'hs-mobile-join-code';
-                    input.type = 'text';
-                    input.autocomplete = 'off';
-                    input.autocapitalize = 'characters';
-                    input.spellcheck = false;
-                    input.maxLength = 30;
-                    input.placeholder = 'Tap here and type party code';
-                    input.setAttribute('aria-label', 'Party code or IP address');
-                    input.style.cssText = 'position:fixed;z-index:9999;box-sizing:border-box;' +
-                      'border:2px solid #e8bd42;border-radius:10px;background:rgba(15,25,38,.96);' +
-                      'color:white;font: bold 18px sans-serif;text-align:center;outline:none;' +
-                      'padding:8px 12px;display:block;touch-action:auto;';
-                    input.addEventListener('input', function() {
-                      window._hs_join_value = input.value;
-                    });
-                    input.addEventListener('keydown', function(e) {
-                      e.stopPropagation();
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        window._hs_join_submit = true;
-                        input.blur();
-                      }
-                    });
-                    document.body.appendChild(input);
-                    window._hs_join_value = '';
-                    window._hs_join_submit = false;
-                  }
-                  var r = canvas.getBoundingClientRect();
-                  var logicalW = {W};
-                  var logicalH = {H};
-                  var sx = r.width / logicalW;
-                  var sy = r.height / logicalH;
-                  input.style.left = (r.left + (logicalW/2 - 310) * sx) + 'px';
-                  input.style.top = (r.top + 440 * sy) + 'px';
-                  input.style.width = (620 * sx) + 'px';
-                  input.style.height = (70 * sy) + 'px';
-                  input.style.fontSize = Math.max(14, 18 * Math.min(sx, sy)) + 'px';
-                  if (typeof window._hs_join_value !== 'string') window._hs_join_value = input.value;
-                  return JSON.stringify({value: input.value, submit: !!window._hs_join_submit});
-                })()
-                """
-                data = json.loads(str(platform.window.eval(js)))
-                self.join_text = data.get("value", "")[:30]
-                if data.get("submit"):
-                    platform.window.eval("window._hs_join_submit = false;")
-                    self.join_submit()
-            else:
-                platform.window.eval(
-                    "(function(){var n=document.getElementById('hs-mobile-player-name');if(n)n.remove();"
-                    "window._hs_name_value='';window._hs_name_submit=false;"
-                    "var e=document.getElementById('hs-mobile-join-code');"
-                    "if(e)e.remove();window._hs_join_value='';window._hs_join_submit=false;})()"
-                )
-        except Exception:
-            pass
+          data = json.loads(str(platform.window.eval(js_name)))
+          self.name_edit_value = data.get("value", "")[:12]
+          if data.get("submit"):
+            platform.window.eval("window._hs_name_submit = false;")
+            self.commit_online_name()
+        else:
+          platform.window.eval(
+              "(function(){var"
+              " n=document.getElementById('hs-mobile-player-name');if(n)n.remove();"
+              "window._hs_name_value='';window._hs_name_submit=false;"
+              "var e=document.getElementById('hs-mobile-join-code');"
+              "if(e)e.remove();window._hs_join_value='';window._hs_join_submit=false;})()"
+          )
+      except Exception:
+        pass
 
     def handle_events(self):
         self.sync_mobile_join_field()
@@ -3753,20 +3700,30 @@ class Game:
         return pygame.Rect(W // 2 - 290, 190 + i * 54, 580, 48)
 
     def events_join(self, event):
-      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-        box = pygame.Rect(W // 2 - 310, 440, 620, 70)
-        if WEB_BUILD and box.collidepoint(event.pos):
-          try:
-            entered = platform.window.prompt(
-                "Enter the 5-letter party code:", self.join_text
-            )
-            if entered is not None:
-              self.join_text = str(entered).strip().upper()[:30]
-              if len(self.join_text) >= 4:
-                self.join_submit()
-          except Exception:
-            pass
-          return
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+          box = pygame.Rect(
+              W // 2 - 310,
+              260 if WEB_BUILD else 440,
+              620,
+              84 if WEB_BUILD else 70,
+          )
+          join_btn = pygame.Rect(W // 2 - 170, 375, 340, 56)
+          if WEB_BUILD and box.collidepoint(event.pos):
+            try:
+              entered = platform.window.prompt(
+                  "Enter the 5-letter party code:", self.join_text
+              )
+              if entered is not None:
+                self.join_text = str(entered).strip().upper()[:30]
+                if len(self.join_text) >= 4:
+                  self.join_submit()
+            except Exception:
+              pass
+            return
+          if WEB_BUILD and join_btn.collidepoint(event.pos):
+            self.join_submit()
+            return
+
         for i, (addr, _) in enumerate(self.lan_list()):
           if self.join_row_rect(i).collidepoint(event.pos):
             self.join_sel = i
@@ -5588,46 +5545,128 @@ class Game:
                   WHITE, (W // 2, H - 36))
 
     def draw_join(self):
-        t = self.menu_t
-        self.draw_menu_bg()
-        draw_text(screen, self.big_font, "JOIN A PARTY", WHITE, (W // 2, 70))
+      t = self.menu_t
+      self.draw_menu_bg()
+      draw_text(screen, self.big_font, "JOIN A PARTY", WHITE, (W // 2, 70))
 
+      if not WEB_BUILD:
         panel = pygame.Rect(W // 2 - 310, 130, 620, 270)
         pygame.draw.rect(screen, UI, panel, border_radius=18)
         pygame.draw.rect(screen, UI_LIGHT, panel, 2, border_radius=18)
-        draw_text(screen, self.tiny_font, "PARTIES ON YOUR NETWORK", (170, 185, 180),
-                  (panel.centerx, panel.top + 22), shadow=False)
+        draw_text(
+            screen,
+            self.tiny_font,
+            "PARTIES ON YOUR NETWORK",
+            (170, 185, 180),
+            (panel.centerx, panel.top + 22),
+            shadow=False,
+        )
 
         lst = self.lan_list()
         if not lst:
-            dots = "." * (1 + int(t * 0.05) % 3)
-            draw_text(screen, self.small_font, "SEARCHING" + dots, (205, 215, 210),
-                      (panel.centerx, panel.top + 120), shadow=False)
+          dots = "." * (1 + int(t * 0.05) % 3)
+          draw_text(
+              screen,
+              self.small_font,
+              "SEARCHING" + dots,
+              (205, 215, 210),
+              (panel.centerx, panel.top + 120),
+              shadow=False,
+          )
         for i, (addr, info) in enumerate(lst):
-            rr = self.join_row_rect(i)
-            sel = (i == self.join_sel) and not self.join_text
-            pygame.draw.rect(screen, UI_LIGHT if sel else (28, 34, 41), rr, border_radius=12)
-            pygame.draw.rect(screen, GOLD if sel else (70, 80, 86), rr, 2, border_radius=12)
-            draw_text(screen, self.small_font, info["name"].upper(), WHITE,
-                      (rr.left + 18, rr.centery), anchor="midleft", shadow=False)
-            status = f"{info['n']}/2 PLAYERS" if info["ph"] == "lobby" else "IN A MATCH"
-            draw_text(screen, self.tiny_font, status, GOLD if info["ph"] == "lobby" else RED_LIGHT,
-                      (rr.right - 18, rr.centery), anchor="midright", shadow=False)
+          rr = self.join_row_rect(i)
+          sel = (i == self.join_sel) and not self.join_text
+          pygame.draw.rect(
+              screen, UI_LIGHT if sel else (28, 34, 41), rr, border_radius=12
+          )
+          pygame.draw.rect(
+              screen, GOLD if sel else (70, 80, 86), rr, 2, border_radius=12
+          )
+          draw_text(
+              screen,
+              self.small_font,
+              info["name"].upper(),
+              WHITE,
+              (rr.left + 18, rr.centery),
+              anchor="midleft",
+              shadow=False,
+          )
+          status = (
+              f"{info['n']}/2 PLAYERS" if info["ph"] == "lobby" else "IN A MATCH"
+          )
+          draw_text(
+              screen,
+              self.tiny_font,
+              status,
+              GOLD if info["ph"] == "lobby" else RED_LIGHT,
+              (rr.right - 18, rr.centery),
+              anchor="midright",
+              shadow=False,
+          )
 
-        box = pygame.Rect(W // 2 - 310, 440, 620, 70)
-        pygame.draw.rect(screen, UI_LIGHT, box, border_radius=16)
-        pygame.draw.rect(screen, GOLD if self.join_text else (90, 100, 105), box, 3, border_radius=16)
-        draw_text(screen, self.tiny_font, "TAP TO TYPE A PARTY CODE / IP ADDRESS" if WEB_BUILD else "OR TYPE A PARTY CODE / IP ADDRESS  (CTRL+V TO PASTE)",
-                  (170, 185, 180), (box.centerx, box.top + 16), shadow=False)
-        caret = "|" if int(t * 0.08) % 2 == 0 else ""
-        shown = (self.join_text + caret) if self.join_text or caret else ""
-        draw_text(screen, self.menu_font, shown, WHITE, (box.centerx, box.top + 46), shadow=False)
+      box = pygame.Rect(
+          W // 2 - 310, 260 if WEB_BUILD else 440, 620, 84 if WEB_BUILD else 70
+      )
+      pygame.draw.rect(screen, UI_LIGHT, box, border_radius=16)
+      pygame.draw.rect(
+          screen,
+          GOLD if self.join_text else (90, 100, 105),
+          box,
+          3,
+          border_radius=16,
+      )
+      hint = (
+          "TAP HERE TO ENTER 5-LETTER ROOM CODE"
+          if WEB_BUILD
+          else "OR TYPE A PARTY CODE / IP ADDRESS  (CTRL+V TO PASTE)"
+      )
+      draw_text(
+          screen,
+          self.tiny_font,
+          hint,
+          (170, 185, 180),
+          (box.centerx, box.top + 18),
+          shadow=False,
+      )
+      caret = "|" if int(t * 0.08) % 2 == 0 else ""
+      shown = (
+          (self.join_text + caret)
+          if (self.join_text or not WEB_BUILD)
+          else "TAP TO TYPE CODE"
+      )
+      draw_text(
+          screen,
+          self.menu_font,
+          shown,
+          WHITE if self.join_text else (150, 165, 175),
+          (box.centerx, box.top + 52),
+          shadow=False,
+      )
 
-        if self.net_msg:
-            col = GOLD if self.net_msg.startswith("Connecting") else RED_LIGHT
-            draw_text(screen, self.small_font, self.net_msg, col, (W // 2, 545))
-        draw_text(screen, self.small_font,
-                  "ENTER  JOIN      UP / DOWN  PICK A PARTY      ESC  BACK", WHITE, (W // 2, H - 36))
+      if WEB_BUILD:
+        join_btn = pygame.Rect(W // 2 - 170, 375, 340, 56)
+        pygame.draw.rect(screen, (20, 65, 85), join_btn, border_radius=15)
+        pygame.draw.rect(screen, GOLD, join_btn, 2, border_radius=15)
+        draw_text(
+            screen,
+            self.font,
+            "JOIN PARTY",
+            GOLD,
+            join_btn.center,
+            shadow=False,
+        )
+
+      if self.net_msg:
+        col = GOLD if self.net_msg.startswith("Connecting") else RED_LIGHT
+        draw_text(screen, self.small_font, self.net_msg, col, (W // 2, 545))
+      draw_text(
+          screen,
+          self.small_font,
+          "ENTER  JOIN      UP / DOWN  PICK A PARTY      ESC  BACK",
+          WHITE,
+          (W // 2, H - 36),
+      )
+
 
     def draw_lobby(self):
         t = self.menu_t
