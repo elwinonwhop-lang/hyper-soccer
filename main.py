@@ -560,6 +560,7 @@ class Sound:
         self.music_tracks = {}
         self.music_channel = None
         self.current_music = None
+        self.last_music_track = "menu"
         try:
             if not pygame.mixer.get_init():
                 try:
@@ -662,14 +663,15 @@ class Sound:
         # Both loops contain exactly four bars, so each downbeat lands cleanly on the loop.
         settings = {
             "menu": {
-                "bpm": 112.0,
-                "chords": [(57, 60, 64), (53, 57, 60), (55, 59, 62), (52, 55, 59)],
-                "melody": [(76, None, 79, 81), (77, None, 81, 84),
-                           (79, 76, 72, 76), (74, None, 79, 83)],
-                "energy": 0.72,
+                "bpm": 132.0,
+                # Bright major-key stadium progression with a rising hook.
+                "chords": [(55, 59, 62), (50, 54, 57), (52, 55, 59), (48, 55, 60)],
+                "melody": [(74, 79, 81, 83), (81, 79, 76, 74),
+                           (79, 83, 86, 83), (76, 79, 84, 86)],
+                "energy": 0.96,
             },
             "match": {
-                "bpm": 150.0,
+                "bpm": 158.0,
                 # Bright, stadium-anthem harmony with a rising finish.
                 "chords": [(48, 55, 60), (45, 52, 57), (41, 48, 53), (43, 50, 55)],
                 "melody": [(76, None, 79, 81), (74, None, 77, 79),
@@ -732,21 +734,22 @@ class Sound:
 
                 # Claps/snare on beats 2 and 4 give the match a crowd-stomp rhythm.
                 snare = 0.0
-                if style == "match" and beat_in_bar in (1, 3) and beat_phase < 0.085:
+                if beat_in_bar in (1, 3) and beat_phase < 0.085:
                     s_env = math.exp(-beat_phase * 62.0)
                     snap = (math.sin(tau * 1703.0 * t) + 0.68 * math.sin(tau * 2513.0 * t)
                             + 0.42 * math.sin(tau * 3691.0 * t))
                     clap = math.sin(tau * 225.0 * t) + 0.45 * math.sin(tau * 510.0 * t)
-                    snare = (snap * 0.035 + clap * 0.045) * s_env
+                    snare_gain = 1.0 if style == "match" else 0.68
+                    snare = (snap * 0.035 + clap * 0.045) * s_env * snare_gain
 
                 # Bright hi-hat on every eighth note adds movement without becoming harsh.
                 hat = 0.0
                 eighth_phase = (beat * 2.0) % 1.0
-                if style == "match" and eighth_phase < 0.045:
+                if eighth_phase < 0.045:
                     h_env = math.exp(-eighth_phase * 105.0)
                     metal = (math.sin(tau * 5231.0 * t) + 0.65 * math.sin(tau * 6817.0 * t)
                              + 0.40 * math.sin(tau * 8123.0 * t))
-                    hat = metal * h_env * 0.012
+                    hat = metal * h_env * (0.012 if style == "match" else 0.006)
 
                 # Synth-brass stabs on bar starts: the little fanfare gives it a football-anthem feel.
                 brass = 0.0
@@ -760,7 +763,7 @@ class Sound:
 
                 # A synthetic crowd "oh-oh" chant, made from layered harmonics rather than a sample.
                 chant = 0.0
-                chant_beats = (0, 2) if style == "match" else (0,)
+                chant_beats = (0, 2)
                 if beat_in_bar in chant_beats and beat_phase < 0.47:
                     c_env = min(1.0, beat_phase * 13.0) * math.exp(-beat_phase * 1.25)
                     chant_note = chord[1] + 12
@@ -768,7 +771,7 @@ class Sound:
                     choir = (math.sin(tau * f * t) + 0.56 * math.sin(tau * f * 2.01 * t)
                              + 0.30 * math.sin(tau * f * 3.02 * t)
                              + 0.16 * math.sin(tau * hz(chant_note + 7) * t))
-                    chant = choir * c_env * (0.045 if style == "match" else 0.025)
+                    chant = choir * c_env * (0.045 if style == "match" else 0.038)
 
                 # A short, melodic hook between drum hits.
                 lead = 0.0
@@ -797,6 +800,8 @@ class Sound:
         """Start/restart the requested background loop when the game screen changes."""
         if not self.ok or self.music_channel is None:
             return
+        if track in self.music_tracks:
+            self.last_music_track = track
         if not self.music_enabled:
             if self.music_channel.get_busy():
                 self.music_channel.stop()
@@ -815,9 +820,15 @@ class Sound:
 
     def toggle_music(self):
         self.music_enabled = not self.music_enabled
-        if not self.music_enabled and self.music_channel is not None:
-            self.music_channel.stop()
-            self.current_music = None
+        if self.music_channel is not None:
+            if not self.music_enabled:
+                self.music_channel.stop()
+                self.current_music = None
+            else:
+                # Restart immediately after an in-game/settings tap, rather than
+                # waiting for the next screen transition.
+                self.current_music = None
+                self.set_music(self.last_music_track or "menu")
 
     def play(self, name, vol=1.0):
         if not (self.ok and self.on):
@@ -1948,7 +1959,10 @@ class Game:
         # Dedicated in-match back arrow; kept separate from menu navigation.
         self.game_back_rect = pygame.Rect(18, 16, 48, 48)
         self.menu_selection = 0
-        self.menu_rects = [pygame.Rect(W // 2 - 260, 200 + i * 76, 520, 64) for i in range(5)]
+        menu_w = min(650, W - 150)
+        menu_h = 64
+        menu_x = (W - menu_w) // 2
+        self.menu_rects = [pygame.Rect(menu_x, 205 + i * 70, menu_w, menu_h) for i in range(5)]
         self.on_rects = [pygame.Rect(W // 2 - 260, 175, 520, 70),
                          pygame.Rect(W // 2 - 260, 275, 520, 84),
                          pygame.Rect(W // 2 - 260, 375, 520, 84)]
@@ -2002,6 +2016,9 @@ class Game:
         self.settings = {"len": MATCH_SECONDS, "pu": True, "bot": 0}
         self.sound = Sound()
         self.profile = self.load_profile()
+        audio_prefs = self.profile.get("audio", {})
+        self.sound.on = bool(audio_prefs.get("effects", True))
+        self.sound.music_enabled = bool(audio_prefs.get("music", True))
         self.upgrade_keys = ("shooting", "pace", "defending")
         self.upgrade_titles = ("SHOOTING POWER", "PACE", "DEFENDING")
         self.upgrade_descriptions = (
@@ -2200,6 +2217,7 @@ class Game:
             "total_goals": 0,
             "wins": 0,
             "matches": 0,
+            "audio": {"music": True, "effects": True},
         }
         self.profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "hyper_soccer_profile.json")
@@ -2217,6 +2235,10 @@ class Game:
                 saved_upgrades = {}
             for key in profile["upgrades"]:
                 profile["upgrades"][key] = int(clamp(int(saved_upgrades.get(key, 0)), 0, 5))
+            saved_audio = stored.get("audio", {})
+            if isinstance(saved_audio, dict):
+                profile["audio"]["music"] = bool(saved_audio.get("music", True))
+                profile["audio"]["effects"] = bool(saved_audio.get("effects", True))
         except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             pass
         return profile
@@ -2529,8 +2551,21 @@ class Game:
         elif typ == "pu":
             self.sound.play("freeze" if int(ex) % 10 == 2 else "pickup")
 
+    def save_audio_preferences(self):
+        if not hasattr(self, "profile"):
+            return
+        self.profile.setdefault("audio", {})
+        self.profile["audio"]["music"] = bool(self.sound.music_enabled)
+        self.profile["audio"]["effects"] = bool(self.sound.on)
+        self.save_profile()
+
+    def toggle_background_music(self):
+        self.sound.toggle_music()
+        self.save_audio_preferences()
+
     def toggle_sound(self):
         self.sound.on = not self.sound.on
+        self.save_audio_preferences()
         self.sound.play("click")
 
     def audio_cues(self):
@@ -3372,7 +3407,7 @@ class Game:
                 and event.key == pygame.K_b
                 and not typing
             ):
-              self.sound.toggle_music()
+              self.toggle_background_music()
               continue
 
             # F11 toggles native desktop fullscreen. On the web, the HTML overlay
@@ -3385,7 +3420,7 @@ class Game:
             st = self.state
             # SDL may deliver touch events without synthesizing mouse clicks on mobile.
             # Convert menu taps to clicks; gameplay keeps native finger events for multitouch.
-            if WEB_BUILD and event.type == pygame.FINGERDOWN and (st in MENU_STATES or st in BACK_NAV_STATES):
+            if event.type == pygame.FINGERDOWN and (st in MENU_STATES or st in BACK_NAV_STATES):
                 event = pygame.event.Event(
                     pygame.MOUSEBUTTONDOWN,
                     {"pos": (int(event.x * W), int(event.y * H)), "button": 1})
@@ -3592,7 +3627,8 @@ class Game:
         self.sound.play("menuok")
 
     def set_row_rect(self, i):
-        return pygame.Rect(50, 165 + i * 92, 540, 76)
+        # Large, forgiving hit targets are important on phone screens.
+        return pygame.Rect(42, 165 + i * 92, min(556, W - 84), 76)
 
     def settings_text(self, i):
         s = self.settings
@@ -3620,9 +3656,11 @@ class Game:
         elif i == 2:
             s["bot"] = (s["bot"] + d) % len(BOT_LEVELS)
         elif i == 3:
-            self.sound.on = not self.sound.on
+            self.toggle_sound()
+            return
         else:
-            self.sound.toggle_music()
+            self.toggle_background_music()
+            return
         self.sound.play("click")
 
     def events_settings(self, event):
@@ -3631,12 +3669,22 @@ class Game:
             for i in range(n):
                 if self.set_row_rect(i).collidepoint(event.pos):
                     self.set_sel = i
+        elif event.type == pygame.FINGERDOWN:
+            # Some mobile SDL builds do not synthesize mouse-down from taps.
+            pos = (int(event.x * W), int(event.y * H))
+            for i in range(n):
+                r = self.set_row_rect(i)
+                if r.collidepoint(pos):
+                    self.set_sel = i
+                    self.settings_change(i, -1 if pos[0] < r.centerx else 1)
+                    return
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for i in range(n):
                 r = self.set_row_rect(i)
                 if r.collidepoint(event.pos):
                     self.set_sel = i
                     self.settings_change(i, -1 if event.pos[0] < r.centerx else 1)
+                    return
         elif event.type == pygame.KEYDOWN:
             k = event.key
             if k in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
@@ -5176,118 +5224,149 @@ class Game:
     def draw_button(self, base_rect, selected, name, desc):
         t = self.menu_t
         rect = base_rect.copy()
+        try:
+            idx = self.menu_rects.index(base_rect)
+        except ValueError:
+            idx = 0
+        accents = ((65, 215, 255), (255, 174, 74), (175, 132, 255),
+                   (255, 105, 130), (100, 238, 174))
+        accent = accents[idx % len(accents)]
         if selected:
-            grow = int(3 + math.sin(t * 0.12) * 2)
+            grow = int(2 + math.sin(t * 0.14) * 1.5)
             rect.inflate_ip(grow * 2, grow)
-            pygame.draw.rect(screen, (19, 47, 68), rect.inflate(14, 10),
-                             2, border_radius=23)
+            glow = pygame.Surface((rect.w + 24, rect.h + 18), pygame.SRCALPHA)
+            glow_col = (*accent, int(22 + 12 * (0.5 + 0.5 * math.sin(t * 0.18))))
+            pygame.draw.rect(glow, glow_col, glow.get_rect(), border_radius=20)
+            screen.blit(glow, (rect.left - 12, rect.top - 9))
 
-        # Drop shadow and glass-dark panel.
-        pygame.draw.rect(screen, (3, 8, 17), rect.move(0, 5), border_radius=20)
-        pygame.draw.rect(screen, (17, 29, 46) if selected else (11, 21, 36),
-                         rect, border_radius=18)
-        border = (73, 211, 255) if selected else (58, 82, 105)
-        pygame.draw.rect(screen, border, rect, 2 if selected else 1, border_radius=18)
-        pygame.draw.line(screen, (40, 110, 145) if selected else (30, 52, 73),
-                         (rect.left + 20, rect.top + 3), (rect.right - 20, rect.top + 3), 2)
+        # Deep layered card with a sharp broadcast-style accent edge.
+        pygame.draw.rect(screen, (2, 7, 15), rect.move(0, 6), border_radius=17)
+        fill = (19, 39, 58) if selected else (10, 23, 38)
+        pygame.draw.rect(screen, fill, rect, border_radius=17)
+        inner = rect.inflate(-4, -4)
+        pygame.draw.rect(screen, (28, 54, 75) if selected else (17, 34, 51),
+                         inner, 1, border_radius=14)
+        pygame.draw.rect(screen, accent if selected else (48, 78, 99), rect,
+                         2 if selected else 1, border_radius=17)
+        pygame.draw.line(screen, (*accent,), (rect.left + 22, rect.top + 2),
+                         (rect.right - 22, rect.top + 2), 2 if selected else 1)
+
+        # Number plate and moving selection marker.
+        tag = pygame.Rect(rect.left + 15, rect.top + 10, 50, rect.h - 20)
+        pygame.draw.rect(screen, (5, 16, 28), tag, border_radius=10)
+        pygame.draw.rect(screen, accent if selected else (55, 88, 111), tag, 1, border_radius=10)
+        number = f"{(idx + 1):02d}"
+        draw_text(screen, self.small_font, number,
+                  accent if selected else (145, 169, 187), tag.center, shadow=False)
         if selected:
-            pulse = int(165 + 70 * (0.5 + 0.5 * math.sin(t * 0.16)))
-            pygame.draw.rect(screen, (36, pulse, 240),
-                             (rect.left + 10, rect.top + 12, 5, rect.h - 24),
+            bar_h = max(16, int((rect.h - 16) * (0.72 + 0.18 * math.sin(t * 0.17))))
+            pygame.draw.rect(screen, accent,
+                             (rect.left + 5, rect.centery - bar_h // 2, 4, bar_h),
                              border_radius=3)
-        draw_text(screen, self.menu_font, name, (103, 220, 255) if selected else WHITE,
-                  (rect.centerx, rect.top + int(rect.h * 0.34)), shadow=False)
-        draw_text(screen, self.small_font, desc, (180, 199, 215),
-                  (rect.centerx, rect.top + int(rect.h * 0.75)), shadow=False)
+
+        name_y = rect.top + int(rect.h * 0.34)
+        desc_y = rect.top + int(rect.h * 0.75)
+        text_color = WHITE if selected else (224, 234, 242)
+        draw_text(screen, self.menu_font, name, text_color,
+                  (rect.centerx + 5, name_y), shadow=False)
+        draw_text(screen, self.small_font, desc, (167, 190, 207),
+                  (rect.centerx + 5, desc_y), shadow=False)
+        # A crisp chevron makes the card feel like a selectable game tile.
+        cx, cy = rect.right - 25, rect.centery
+        chevron_col = accent if selected else (102, 130, 151)
+        pygame.draw.line(screen, chevron_col, (cx - 5, cy - 7), (cx + 2, cy), 2)
+        pygame.draw.line(screen, chevron_col, (cx + 2, cy), (cx - 5, cy + 7), 2)
 
     def draw_menu(self):
         t = self.menu_t
         self.draw_menu_bg()
 
-        # Juggling demo: two players pass the ball in an arc.
-        ground = 585
+        # Animated match showcase: two kit-clad players keep the title screen alive.
+        ground = H - 70
         phase = t * 0.028
-        lx, rx = 200, W - 200
-        bx = W / 2 + math.sin(phase) * (W / 2 - 250)
-        height = abs(math.cos(phase)) * 170
+        lx, rx = 185, W - 185
+        bx = W / 2 + math.sin(phase) * (W / 2 - 245)
+        height = abs(math.cos(phase)) * 155
         for p, px, face in ((self.menu_p1, lx, 1.0), (self.menu_p2, rx, -1.0)):
             p.x = px
-            p.y = ground - 16 + math.sin(t * 0.07 + (0 if face > 0 else 1.5)) * 3
+            p.y = ground - 15 + math.sin(t * 0.07 + (0 if face > 0 else 1.5)) * 3
             p.facing_x, p.facing_y = face, 0.0
             p.kick_timer = 6.0 if abs(math.cos(phase)) < 0.1 and (bx - W / 2) * face < 0 else 0.0
         self.menu_p1.draw(screen)
         self.menu_p2.draw(screen)
         draw_ball(screen, bx, ground - height - 4, 13, t * 0.15, ground - 4)
 
-        # Title sits on a restrained neon plate so it reads clearly over the stadium.
-        title_plate = pygame.Rect(W // 2 - 340, 39, 680, 100)
+        # Large esports-style masthead.
+        title_plate = pygame.Rect(W // 2 - 360, 24, 720, 124)
         plate = pygame.Surface((title_plate.w, title_plate.h), pygame.SRCALPHA)
-        pygame.draw.rect(plate, (4, 12, 26, 155), plate.get_rect(), border_radius=26)
-        pygame.draw.rect(plate, (76, 166, 205, 100), plate.get_rect(), 2, border_radius=26)
+        pygame.draw.rect(plate, (3, 10, 22, 218), plate.get_rect(), border_radius=25)
+        pygame.draw.rect(plate, (70, 195, 229, 155), plate.get_rect(), 2, border_radius=25)
+        pygame.draw.line(plate, (255, 183, 74, 170), (28, 5), (title_plate.w - 28, 5), 3)
         screen.blit(plate, title_plate.topleft)
-        draw_text(screen, self.tiny_font, "ARCADE  •  FOOTBALL  •  ONLINE",
-                  (126, 190, 212), (W // 2, 49), shadow=False)
-        words = [("HYPER", BLUE_LIGHT), ("SOCCER", RED_LIGHT)]
-        total_w = sum(self.title_font.size(w)[0] for w, _ in words) + 36
+        draw_text(screen, self.tiny_font, "THE ARCADE FOOTBALL ARENA",
+                  (156, 207, 226), (W // 2, 43), shadow=False)
+        words = [("HYPER", (99, 220, 255)), ("SOCCER", (255, 158, 104))]
+        total_w = sum(self.title_font.size(w)[0] for w, _ in words) + 30
         cx = W // 2 - total_w // 2
         for word, col in words:
             for ch in word:
                 gw = self.title_font.size(ch)[0]
                 k = (cx - W // 2) * 0.012
-                yo = math.sin(t * 0.05 + k) * 5
+                yo = math.sin(t * 0.05 + k) * 3
                 img = self.title_font.render(ch, True, col)
                 glow = self.title_font.render(ch, True, col)
-                glow.set_alpha(65)
-                screen.blit(glow, (cx + 2, 72 + yo + 2))
+                glow.set_alpha(58)
+                screen.blit(glow, (cx + 2, 60 + yo + 2))
                 sh = self.title_font.render(ch, True, (0, 0, 0))
-                sh.set_alpha(180)
-                screen.blit(sh, (cx + 3, 72 + yo + 4))
-                screen.blit(img, (cx, 72 + yo))
+                sh.set_alpha(190)
+                screen.blit(sh, (cx + 3, 60 + yo + 4))
+                screen.blit(img, (cx, 60 + yo))
                 cx += gw
-            cx += 36
-        pygame.draw.line(screen, (58, 181, 221), (W // 2 - 220, 145), (W // 2 + 220, 145), 2)
-        draw_text(screen, self.small_font, "ARCADE SOCCER  -  CHOOSE YOUR GAME MODE",
-                  (190, 220, 235), (W // 2, 166))
+            cx += 30
+        pygame.draw.line(screen, (80, 204, 239), (W // 2 - 250, 151),
+                         (W // 2 + 250, 151), 2)
+        draw_text(screen, self.small_font, "PICK A MODE. OWN THE MATCH.",
+                  (217, 231, 241), (W // 2, 168), shadow=False)
+
+        # Compact, high-contrast navigation chips along the top corners.
+        nav_items = ((self.customize_rect, "KIT LAB", (255, 202, 91)),
+                     (self.upgrade_rect, f"UPGRADES  {self.profile['coins']} C", (116, 238, 173)),
+                     (self.settings_rect, "SETTINGS", (92, 215, 255)))
+        for rect, label, accent in nav_items:
+            hover = rect.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(screen, (3, 9, 18), rect.move(0, 4), border_radius=12)
+            pygame.draw.rect(screen, (19, 34, 51) if not hover else (28, 54, 72),
+                             rect, border_radius=12)
+            pygame.draw.rect(screen, accent if hover else (67, 100, 123), rect,
+                             2 if hover else 1, border_radius=12)
+            pygame.draw.rect(screen, accent, (rect.left + 8, rect.top + 9, 4, rect.h - 18),
+                             border_radius=2)
+            draw_text(screen, self.small_font, label, accent if hover else WHITE,
+                      rect.center, shadow=False)
+
+        # Small live status strip above the mode cards.
+        strip = pygame.Rect(W // 2 - 160, 180, 320, 20)
+        pygame.draw.rect(screen, (4, 14, 25), strip, border_radius=8)
+        pygame.draw.circle(screen, (95, 235, 165), (strip.left + 13, strip.centery), 4)
+        draw_text(screen, self.tiny_font, "ARCADE MODES  /  SEASON 01",
+                  (161, 190, 208), (strip.centerx + 8, strip.centery), shadow=False)
 
         options = [
             ("1 V 1", "Play against another player on this device"),
-            ("1 V BOT", "Play against the computer"),
-            ("ONLINE PARTY", "Create or join a party over the internet"),
-            ("PENALTY SHOOTOUTS", "Pick your shot. Can you beat the keeper?"),
+            ("1 V BOT", "Take on the computer and test your skills"),
+            ("ONLINE PARTY", "Create a room or join a friend's party"),
+            ("PENALTY SHOOTOUTS", "Pick your shot. Beat the goalkeeper"),
             ("2V2 SQUAD", "You and an AI teammate vs a rival AI duo"),
         ]
         for i, (name, description) in enumerate(options):
-          self.draw_button(
-              self.menu_rects[i], self.menu_selection == i, name, description
-          )
+            self.draw_button(self.menu_rects[i], self.menu_selection == i, name, description)
 
-
-        cr = self.customize_rect
-        chov = cr.collidepoint(pygame.mouse.get_pos())
-        pygame.draw.rect(screen, UI_LIGHT if chov else UI, cr, border_radius=14)
-        pygame.draw.rect(screen, GOLD if chov else (90, 100, 105), cr, 3, border_radius=14)
-        draw_text(screen, self.small_font, "CUSTOMIZE  (C)", GOLD if chov else WHITE, cr.center, shadow=False)
-
-        ur = self.upgrade_rect
-        uhov = ur.collidepoint(pygame.mouse.get_pos())
-        pygame.draw.rect(screen, UI_LIGHT if uhov else UI, ur, border_radius=14)
-        pygame.draw.rect(screen, GOLD if uhov else (90, 100, 105), ur, 3 if uhov else 1, border_radius=14)
-        draw_text(screen, self.small_font, f"UPGRADES  (U)  ·  {self.profile['coins']} C",
-                  GOLD if uhov else WHITE, ur.center, shadow=False)
-
-        sr = self.settings_rect
-        hov = sr.collidepoint(pygame.mouse.get_pos())
-        pygame.draw.rect(screen, UI_LIGHT if hov else UI, sr, border_radius=14)
-        pygame.draw.rect(screen, GOLD if hov else (90, 100, 105), sr, 3, border_radius=14)
-        draw_text(screen, self.small_font, "SETTINGS  (O)", GOLD if hov else WHITE, sr.center,
-                  shadow=False)
-
-        music_label = "MUSIC ON [B]" if self.sound.music_enabled else "MUSIC OFF [B]"
-        draw_text(screen, self.small_font,
-                  f"UP / DOWN SELECT   ENTER PLAY   C CUSTOMIZE   U UPGRADES   O SETTINGS   {music_label}   F11 FULLSCREEN",
-                  WHITE, (W // 2, H - 24))
+        music_label = "MUSIC: ON" if self.sound.music_enabled else "MUSIC: OFF"
+        effects_label = "SFX: ON" if self.sound.on else "SFX: OFF"
+        footer = f"TAP A MODE TO PLAY     {music_label}  [B]     {effects_label}  [N]     F11 FULLSCREEN"
+        draw_text(screen, self.tiny_font, footer, (179, 201, 216), (W // 2, H - 19), shadow=False)
         if WEB_BUILD and self.net_msg:
-            draw_text(screen, self.small_font, self.net_msg, GOLD, (W // 2, H - 54))
+            draw_text(screen, self.small_font, self.net_msg, GOLD, (W // 2, H - 45))
 
     def events_customize(self, event):
         if event.type == pygame.KEYDOWN:
@@ -5411,29 +5490,57 @@ class Game:
 
     def draw_settings(self):
         self.draw_menu_bg()
-        draw_text(screen, self.big_font, "SETTINGS", WHITE, (W // 2, 70))
+        draw_text(screen, self.big_font, "SETTINGS", WHITE, (W // 2, 67))
+        draw_text(screen, self.tiny_font, "TAP ANY SETTING TO CHANGE IT",
+                  (153, 191, 211), (W // 2, 111), shadow=False)
 
         for i, (name, hint) in enumerate(self.SET_ROWS):
             r = self.set_row_rect(i)
             sel = i == self.set_sel
-            pygame.draw.rect(screen, UI_LIGHT if sel else UI, r, border_radius=16)
-            pygame.draw.rect(screen, GOLD if sel else (90, 100, 105), r, 3, border_radius=16)
-            draw_text(screen, self.small_font, name, WHITE if sel else (205, 215, 210),
-                      (r.left + 22, r.top + 26), anchor="midleft", shadow=False)
-            draw_text(screen, self.tiny_font, hint, (150, 165, 160),
-                      (r.left + 22, r.top + 54), anchor="midleft", shadow=False)
+            pygame.draw.rect(screen, (3, 8, 16), r.move(0, 4), border_radius=14)
+            pygame.draw.rect(screen, (21, 43, 62) if sel else (11, 25, 40), r,
+                             border_radius=14)
+            pygame.draw.rect(screen, (78, 211, 247) if sel else (54, 86, 108),
+                             r, 2 if sel else 1, border_radius=14)
+            pygame.draw.rect(screen, (255, 190, 81) if i in (3, 4) else (74, 197, 232),
+                             (r.left + 8, r.top + 10, 4, r.h - 20), border_radius=2)
+            draw_text(screen, self.small_font, name, WHITE if sel else (205, 220, 231),
+                      (r.left + 24, r.top + 26), anchor="midleft", shadow=False)
+            draw_text(screen, self.tiny_font, hint, (150, 173, 192),
+                      (r.left + 24, r.top + 54), anchor="midleft", shadow=False)
             val = self.settings_text(i)
-            cx = r.right - 150
-            font = self.font if len(val) <= 6 else self.small_font
-            draw_text(screen, font, val, GOLD if sel else WHITE, (cx, r.centery), shadow=False)
-            if sel:
-                bump = int(math.sin(self.menu_t * 0.2) * 3)
-                draw_text(screen, self.font, "<", GOLD, (cx - 100 - bump, r.centery), shadow=False)
-                draw_text(screen, self.font, ">", GOLD, (cx + 100 + bump, r.centery), shadow=False)
 
-        panel = pygame.Rect(620, 150, 530, 470)
-        pygame.draw.rect(screen, UI, panel, border_radius=18)
-        pygame.draw.rect(screen, UI_LIGHT, panel, 2, border_radius=18)
+            if i in (1, 3, 4):
+                # Large ON/OFF switch, with a clear state for touch users.
+                sw = pygame.Rect(r.right - 112, r.centery - 17, 92, 34)
+                enabled = (self.settings["pu"] if i == 1 else
+                           self.sound.on if i == 3 else self.sound.music_enabled)
+                audio_unavailable = i in (3, 4) and not self.sound.ok
+                track = ((54, 66, 78) if audio_unavailable else
+                         (35, 151, 105) if enabled else (83, 93, 107))
+                pygame.draw.rect(screen, track, sw, border_radius=17)
+                pygame.draw.rect(screen, (210, 230, 239), sw, 1, border_radius=17)
+                if audio_unavailable:
+                    draw_text(screen, self.tiny_font, "NO AUDIO", WHITE,
+                              sw.center, shadow=False)
+                else:
+                    knob_x = sw.right - 17 if enabled else sw.left + 17
+                    pygame.draw.circle(screen, (245, 250, 252), (knob_x, sw.centery), 12)
+                    draw_text(screen, self.tiny_font, "ON" if enabled else "OFF",
+                              WHITE, (sw.centerx, sw.centery), shadow=False)
+            else:
+                cx = r.right - 122
+                font = self.font if len(val) <= 6 else self.small_font
+                draw_text(screen, font, val, GOLD if sel else WHITE,
+                          (cx, r.centery), shadow=False)
+                if sel:
+                    bump = int(math.sin(self.menu_t * 0.2) * 2)
+                    draw_text(screen, self.font, "<", GOLD, (cx - 95 - bump, r.centery), shadow=False)
+                    draw_text(screen, self.font, ">", GOLD, (cx + 95 + bump, r.centery), shadow=False)
+
+        panel = pygame.Rect(620, 150, max(360, W - 670), 470)
+        pygame.draw.rect(screen, (7, 17, 29), panel, border_radius=18)
+        pygame.draw.rect(screen, (61, 99, 125), panel, 2, border_radius=18)
         draw_text(screen, self.small_font, "HOW TO PLAY", GOLD, (panel.centerx, panel.top + 28),
                   shadow=False)
         lines = (("MOVE", "WASD OR ARROW KEYS"),
@@ -5442,15 +5549,14 @@ class Game:
                  ("DASH", "SHIFT  -  USES STAMINA"))
         for i, (a, b) in enumerate(lines):
             y = panel.top + 68 + i * 30
-            draw_text(screen, self.tiny_font, a, BLUE_LIGHT, (panel.left + 30, y), anchor="midleft",
-                      shadow=False)
-            draw_text(screen, self.tiny_font, b, WHITE, (panel.left + 130, y), anchor="midleft",
-                      shadow=False)
+            draw_text(screen, self.tiny_font, a, BLUE_LIGHT, (panel.left + 30, y),
+                      anchor="midleft", shadow=False)
+            draw_text(screen, self.tiny_font, b, WHITE, (panel.left + 130, y),
+                      anchor="midleft", shadow=False)
         draw_text(screen, self.tiny_font, "1 V 1:  BLUE = WASD  E  R  LSHIFT",
-                  (170, 185, 180), (panel.left + 30, panel.top + 198), anchor="midleft", shadow=False)
-        draw_text(screen, self.tiny_font, "              RED = ARROWS  P  L  RSHIFT",
-                  (170, 185, 180), (panel.left + 30, panel.top + 220), anchor="midleft", shadow=False)
-
+                  (170, 185, 200), (panel.left + 30, panel.top + 198), anchor="midleft", shadow=False)
+        draw_text(screen, self.tiny_font, "RED = ARROWS  P  L  RSHIFT",
+                  (170, 185, 200), (panel.left + 30, panel.top + 220), anchor="midleft", shadow=False)
         draw_text(screen, self.small_font, "POWER-UPS", GOLD, (panel.centerx, panel.top + 262),
                   shadow=False)
         descs = ("FASTER AND NO STAMINA DRAIN  -  8 SECONDS",
@@ -5461,14 +5567,13 @@ class Game:
             draw_powerup(screen, t, panel.left + 50, ry, self.menu_t, 14)
             draw_text(screen, self.small_font, PU_NAMES[t], PU_COLORS[t],
                       (panel.left + 90, ry - 9), anchor="midleft", shadow=False)
-            draw_text(screen, self.tiny_font, descs[t], (205, 215, 210),
+            draw_text(screen, self.tiny_font, descs[t], (205, 215, 225),
                       (panel.left + 90, ry + 11), anchor="midleft", shadow=False)
         draw_text(screen, self.tiny_font, "TIED AT FULL TIME  =  GOLDEN GOAL  (NEXT GOAL WINS)",
                   WHITE, (panel.centerx, panel.bottom - 22), shadow=False)
-
-        draw_text(screen, self.small_font,
-                  "UP / DOWN  SELECT      LEFT / RIGHT  CHANGE      ESC  BACK", WHITE,
-                  (W // 2, H - 36))
+        draw_text(screen, self.tiny_font,
+                  "TAP A ROW OR USE LEFT / RIGHT TO CHANGE  •  B MUSIC  •  N SOUND EFFECTS",
+                  (179, 201, 216), (W // 2, H - 24), shadow=False)
 
     def draw_online_menu(self):
         t = self.menu_t
@@ -6650,4 +6755,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
- 
