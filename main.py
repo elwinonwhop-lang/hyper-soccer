@@ -3757,7 +3757,21 @@ class Game:
 
     def events_lobby(self, event):
       if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-        # Larger tap area for Ready Up / Start Match on phones
+        # 1. Check 1V1 / 2V2 Toggle first with a generous mobile tap zone (y: 418..474)
+        squad_hit = pygame.Rect(W // 2 - 220, 418, 440, 56)
+        if self.mode == "host" and squad_hit.collidepoint(event.pos):
+          self.squad_mode = not self.squad_mode
+          self.refresh_online_slots()
+          self.net_msg = (
+              "AI WILL FILL OPEN SLOTS"
+              if self.squad_mode
+              else "CLASSIC 1V1 ENABLED"
+          )
+          self.lobby_send_t = -10.0
+          self.sound.play("menuok")
+          return
+
+        # 2. Check Start / Ready Up button (y: 495..569)
         start_hit = pygame.Rect(W // 2 - 200, 495, 400, 74)
         if self.mode == "host" and start_hit.collidepoint(event.pos):
           self.host_start_match()
@@ -3767,6 +3781,8 @@ class Game:
           self.lobby_send_t = -10.0
           self.sound.play("menuok")
           return
+
+        # 3. Check Blue / Red team selection cards
         if getattr(
             self, "lobby_blue_rect", pygame.Rect(0, 0, 0, 0)
         ).collidepoint(event.pos):
@@ -3795,59 +3811,8 @@ class Game:
             self.lobby_send_t = -10.0
             self.sound.play("menuok")
           return
-        if self.mode == "host" and getattr(
-            self, "lobby_squad_rect", pygame.Rect(0, 0, 0, 0)
-        ).collidepoint(event.pos):
-          self.squad_mode = not self.squad_mode
-          self.refresh_online_slots()
-          self.net_msg = (
-              "AI WILL FILL OPEN SLOTS"
-              if self.squad_mode
-              else "CLASSIC 1V1 ENABLED"
-          )
-          self.lobby_send_t = -10.0
-          self.sound.play("menuok")
-          return
         return
-      if event.type != pygame.KEYDOWN:
-        return
-        k = event.key
-        if k == pygame.K_f and self.mode == "host":
-            self.squad_mode = not self.squad_mode
-            self.refresh_online_slots()
-            self.net_msg = "AI WILL FILL OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1 ENABLED"
-            self.lobby_send_t = -10.0
-            self.sound.play("menuok")
-        elif k in (pygame.K_b, pygame.K_1) and self.squad_mode:
-            if self.mode == "host":
-                self.host_team = 0
-            else:
-                self.guest_team = 0
-                self.my_ready = False
-                self.team_change_pending = True
-            self.refresh_online_slots()
-            self.lobby_send_t = -10.0
-        elif k in (pygame.K_r, pygame.K_2) and self.squad_mode:
-            if self.mode == "host":
-                self.host_team = 1
-            else:
-                self.guest_team = 1
-                self.my_ready = False
-                self.team_change_pending = True
-            self.refresh_online_slots()
-            self.lobby_send_t = -10.0
-        elif k == pygame.K_n:
-            self.toggle_sound()
-        elif k == pygame.K_ESCAPE:
-            self.leave_party()
-        elif k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
-            if self.mode == "host":
-                self.host_start_match()
-            else:
-                self.my_ready = not self.my_ready
-                self.lobby_send_t = -10.0
-        elif k == pygame.K_i and self.mode == "host":
-            self.lookup_public()
+
 
     def events_game(self, event):
 
@@ -5733,7 +5698,7 @@ class Game:
                           (170, 185, 195), (rect.centerx, rect.bottom - 17), shadow=False)
 
         draw_text(screen, self.font, "VS", WHITE, (W // 2, 295))
-        self.lobby_squad_rect = pygame.Rect(W // 2 - 190, 426, 380, 38)
+        self.lobby_squad_rect = pygame.Rect(W // 2 - 210, 422, 420, 46)
         if host:
             mode_label = "2V2 HYBRID  ·  AI FILLS OPEN SLOTS" if self.squad_mode else "CLASSIC 1V1"
             mode_col = GOLD if self.squad_mode else (180, 200, 215)
