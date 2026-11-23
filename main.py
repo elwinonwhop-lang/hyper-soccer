@@ -3700,30 +3700,26 @@ class Game:
         return pygame.Rect(W // 2 - 290, 190 + i * 54, 580, 48)
 
     def events_join(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-          box = pygame.Rect(
-              W // 2 - 310,
-              260 if WEB_BUILD else 440,
-              620,
-              84 if WEB_BUILD else 70,
-          )
-          join_btn = pygame.Rect(W // 2 - 170, 375, 340, 56)
-          if WEB_BUILD and box.collidepoint(event.pos):
-            try:
-              entered = platform.window.prompt(
-                  "Enter the 5-letter party code:", self.join_text
-              )
-              if entered is not None:
-                self.join_text = str(entered).strip().upper()[:30]
-                if len(self.join_text) >= 4:
-                  self.join_submit()
-            except Exception:
-              pass
-            return
-          if WEB_BUILD and join_btn.collidepoint(event.pos):
-            self.join_submit()
-            return
-
+      if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        box = pygame.Rect(
+            W // 2 - 310, 260 if WEB_BUILD else 440, 620, 84 if WEB_BUILD else 70
+        )
+        join_btn = pygame.Rect(W // 2 - 170, 375, 340, 56)
+        if WEB_BUILD and box.collidepoint(event.pos):
+          try:
+            entered = platform.window.prompt(
+                "Enter the 5-letter party code:", self.join_text
+            )
+            if entered is not None:
+              self.join_text = str(entered).strip().upper()[:30]
+              if len(self.join_text) >= 4:
+                self.join_submit()
+          except Exception:
+            pass
+          return
+        if WEB_BUILD and join_btn.collidepoint(event.pos):
+          self.join_submit()
+          return
         for i, (addr, _) in enumerate(self.lan_list()):
           if self.join_row_rect(i).collidepoint(event.pos):
             self.join_sel = i
