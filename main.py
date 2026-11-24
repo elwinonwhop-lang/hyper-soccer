@@ -6839,6 +6839,7 @@ class Game:
         self.last_match_reward = ""
         self.match_rewarded = False
         self.set_sel = 0
+        self.settings_tap_cooldown = 0.0
         self.settings_rect = pygame.Rect(W - 200, 22, 170, 46)
         self.customize_rect = pygame.Rect(30, 22, 190, 46)
         self.upgrade_rect = pygame.Rect(30, 80, 190, 46)
@@ -8493,20 +8494,23 @@ class Game:
                 if self.set_row_rect(i).collidepoint(event.pos):
                     self.set_sel = i
         elif event.type == pygame.FINGERDOWN:
-            # Some mobile SDL builds do not synthesize mouse-down from taps.
             pos = (int(event.x * W), int(event.y * H))
             for i in range(n):
                 r = self.set_row_rect(i)
                 if r.collidepoint(pos):
                     self.set_sel = i
-                    self.settings_change(i, -1 if pos[0] < r.centerx else 1)
+                    if self.settings_tap_cooldown <= 0:
+                        self.settings_tap_cooldown = 15.0
+                        self.settings_change(i, -1 if pos[0] < r.centerx else 1)
                     return
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for i in range(n):
                 r = self.set_row_rect(i)
                 if r.collidepoint(event.pos):
                     self.set_sel = i
-                    self.settings_change(i, -1 if event.pos[0] < r.centerx else 1)
+                    if self.settings_tap_cooldown <= 0:
+                        self.settings_tap_cooldown = 15.0
+                        self.settings_change(i, -1 if event.pos[0] < r.centerx else 1)
                     return
         elif event.type == pygame.KEYDOWN:
             k = event.key
@@ -9334,6 +9338,7 @@ class Game:
     def update(self, dt):
         self.ui_t += dt
         self.fade = max(0.0, self.fade - 7.0 * dt)
+        self.settings_tap_cooldown = max(0.0, self.settings_tap_cooldown - dt)
         self.coin_timer = max(0.0, self.coin_timer - dt)
         self.shop_message_timer = max(0.0, self.shop_message_timer - dt)
         self.shake *= 0.86 ** dt
