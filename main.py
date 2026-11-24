@@ -326,7 +326,31 @@ def setup_web_fullscreen_ui():
           updateButton();
         }
 
-        button.onclick = enterOrExitFullscreen;
+        /* Fullscreen is now controlled by the in-game button between Back and Settings.
+           Keep the old DOM element hidden so it cannot cover gameplay on phones. */
+        if (button) button.style.display = 'none';
+        window._hs_toggle_fullscreen = enterOrExitFullscreen;
+        window._hs_match_ui_active = false;
+
+        /* The browser requires fullscreen to be requested directly in a user gesture.
+           This canvas listener handles the visible in-game hit area before Pygame polls it. */
+        function isInGameFullscreenZone(evt) {
+          if (!canvas) return false;
+          var rect = canvas.getBoundingClientRect();
+          if (!rect.width || !rect.height) return false;
+          var nx = (evt.clientX - rect.left) / rect.width;
+          var ny = (evt.clientY - rect.top) / rect.height;
+          return Math.abs(nx - 0.5) <= 0.045 && ny >= 0.012 && ny <= 0.105;
+        }
+        if (canvas && !canvas._hsFullscreenPointerBound) {
+          canvas._hsFullscreenPointerBound = true;
+          canvas.addEventListener('pointerdown', function(evt) {
+            if (window._hs_match_ui_active && isInGameFullscreenZone(evt)) {
+              enterOrExitFullscreen();
+            }
+          }, {passive: true});
+        }
+
         if (rotateOverlay) {
           var rotateButton = rotateOverlay.querySelector('button');
           if (rotateButton) rotateButton.onclick = enterOrExitFullscreen;
@@ -336,7 +360,7 @@ def setup_web_fullscreen_ui():
           sizeCanvas();
           var portrait = window.innerHeight > window.innerWidth;
           if (rotateOverlay) rotateOverlay.style.display = portrait ? 'flex' : 'none';
-          if (button) button.style.display = (phone && portrait) ? 'none' : 'flex';
+          if (button) button.style.display = 'none';
         }
 
         function updateButton() {
@@ -6784,6 +6808,8 @@ class Game:
         self.name_editing = False
         self.name_edit_value = ""
         self.game_settings_button = pygame.Rect(W - 64, 14, 46, 46)
+        # Fullscreen control sits in the clear top-center gap between Back and Settings.
+        self.game_fullscreen_button = pygame.Rect(W // 2 - 23, 14, 46, 46)
         self.game_settings_panel = pygame.Rect(W // 2 - 230, H // 2 - 150, 460, 300)
         self.game_settings_right_rect = pygame.Rect(W // 2 - 180, H // 2 - 62, 360, 58)
         self.game_settings_name_rect = pygame.Rect(W // 2 - 180, H // 2 + 12, 360, 58)
@@ -8269,6 +8295,28 @@ class Game:
             p2 = (int(r.centerx + math.cos(a) * 15), int(r.centery + math.sin(a) * 15))
             pygame.draw.line(screen, GOLD, p1, p2, 3)
 
+    def draw_game_fullscreen_button(self):
+        """Fullscreen toggle placed in the top gap between Back and Match Settings."""
+        if self.state not in ("countdown", "play", "goal", "paused"):
+            return
+        r = self.game_fullscreen_button
+        hover = r.collidepoint(pygame.mouse.get_pos())
+        edge = GOLD if hover else (125, 215, 239)
+        pygame.draw.circle(screen, (5, 16, 27), r.center, 24)
+        pygame.draw.circle(screen, (67, 110, 137), r.center, 22, 2)
+        pygame.draw.circle(screen, (20, 39, 55) if not hover else (31, 62, 81),
+                           r.center, 18)
+        # Four crisp corner strokes form a familiar fullscreen/expand symbol.
+        cx, cy = r.center
+        reach, inner = 10, 3
+        for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            pygame.draw.line(screen, edge,
+                             (cx + sx * inner, cy + sy * reach),
+                             (cx + sx * reach, cy + sy * reach), 3)
+            pygame.draw.line(screen, edge,
+                             (cx + sx * reach, cy + sy * inner),
+                             (cx + sx * reach, cy + sy * reach), 3)
+
     def draw_game_settings_overlay(self):
         if not self.game_settings_open:
             return
@@ -8638,6 +8686,21 @@ class Game:
 
 
     def events_game(self, event):
+
+        # The center-top fullscreen button is independent of the settings panel and
+        # is checked before movement/action controls so it never triggers gameplay.
+        if self.state in ("countdown", "play", "goal", "paused"):
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.game_fullscreen_button.collidepoint(event.pos):
+                    if not WEB_BUILD:
+                        set_desktop_fullscreen(not DISPLAY_FULLSCREEN)
+                    # In web builds, the canvas pointerdown listener above invokes
+                    # requestFullscreen directly inside the browser gesture.
+                    return
+            elif event.type == pygame.FINGERDOWN:
+                fs_pos = (int(event.x * W), int(event.y * H))
+                if self.game_fullscreen_button.collidepoint(fs_pos):
+                    return
 
         # Live match settings stay in the match; they never reset or disconnect it.
         if self.game_settings_open:
@@ -11756,6 +11819,7 @@ class Game:
         self.draw_game_back_button()
         self.draw_game_settings_button()
         self.draw_game_settings_overlay()
+        self.draw_game_fullscreen_button()
         if self.coin_timer > 0 and self.coin_message and self.state not in ("finished", "replay"):
             toast = pygame.Rect(W // 2 - 200, 112, 400, 42)
             pygame.draw.rect(screen, (18, 28, 35), toast, border_radius=12)
@@ -11794,6 +11858,7 @@ class Game:
             screen.blit(f, (0, 0))
 
     async def run(self):
+        web_fullscreen_ui_active = None
         while self.running:
             ms = clock.tick(FPS)
             dt = min(ms / (1000.0 / 60.0), 2.5)
@@ -11801,6 +11866,14 @@ class Game:
             if not self.running:
                 break
             self.update(dt)
+            if WEB_BUILD:
+                active = self.state in ("countdown", "play", "goal", "paused")
+                if active != web_fullscreen_ui_active:
+                    try:
+                        platform.window.eval("window._hs_match_ui_active = " + ("true" if active else "false") + ";")
+                    except Exception:
+                        pass
+                    web_fullscreen_ui_active = active
             self.draw()
             # Yield to the browser so it can render, process touch input and update the page.
             await asyncio.sleep(0)
