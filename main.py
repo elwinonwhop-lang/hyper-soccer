@@ -78,8 +78,8 @@ PROTO = 5            # hybrid 2v2 plus authoritative sliding-keeper snapshots
 MAGIC = "HSOC"
 INTERP_DELAY = 0.105  # seconds behind the host; gives WebSocket jitter room to settle
 
-MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades")
-BACK_NAV_STATES = ("online_menu", "join", "lobby", "settings", "customize", "upgrades",
+MENU_STATES = ("menu", "online_menu", "join", "lobby", "settings", "customize", "upgrades", "stadiums")
+BACK_NAV_STATES = ("online_menu", "join", "lobby", "settings", "customize", "upgrades", "stadiums",
                    "penalties", "penalty_finished", "finished", "replay")
 GAME_STATES = ("countdown", "play", "goal", "finished")
 STATE_IDX = {"countdown": 0, "play": 1, "goal": 2, "finished": 3}
@@ -6760,7 +6760,7 @@ class Game:
         menu_w = min(650, W - 150)
         menu_h = 64
         menu_x = (W - menu_w) // 2
-        self.menu_rects = [pygame.Rect(menu_x, 205 + i * 70, menu_w, menu_h) for i in range(5)]
+        self.menu_rects = [pygame.Rect(menu_x, 205 + i * 70, menu_w, menu_h) for i in range(6)]
         self.on_rects = [pygame.Rect(W // 2 - 260, 175, 520, 70),
                          pygame.Rect(W // 2 - 260, 275, 520, 84),
                          pygame.Rect(W // 2 - 260, 375, 520, 84)]
@@ -6839,8 +6839,18 @@ class Game:
         self.last_match_reward = ""
         self.match_rewarded = False
         self.set_sel = 0
-        self.settings_tap_cooldown = 0.0
         self.settings_rect = pygame.Rect(W - 200, 22, 170, 46)
+        self.stadium_select_rect = pygame.Rect(W - 390, 22, 170, 46)
+        self.stadium_names = ("NEON ARENA", "SUNSET BEACH", "FROST DOME", "JUNGLE CUP")
+        self.stadium_index = 0
+        self.stadium_choice_rects = [pygame.Rect(W // 2 - 430 + i * 220, H // 2 - 30, 200, 190)
+                                     for i in range(4)]
+        self.tournament_active = False
+        self.tournament_round = 0
+        self.tournament_wins = 0
+        self.tournament_losses = 0
+        self.tournament_completed = False
+        self.tournament_result = ""
         self.customize_rect = pygame.Rect(30, 22, 190, 46)
         self.upgrade_rect = pygame.Rect(30, 80, 190, 46)
         self.kit_indices = [0, 1]
@@ -7227,6 +7237,7 @@ class Game:
 
     def start_match(self, mode):
         self.mode = mode
+        self.field_surface = None
         if mode in ("host", "client"):
             self.refresh_online_slots()
         if mode == "squad":
@@ -8244,6 +8255,8 @@ class Game:
                 self.events_customize(event)
             elif st == "upgrades":
                 self.events_upgrades(event)
+            elif st == "stadiums":
+                self.events_stadiums(event)
             elif st in ("penalties", "penalty_finished"):
                 self.events_penalties(event)
             else:
@@ -8258,7 +8271,7 @@ class Game:
         elif state in ("join", "lobby"):
             # Closes the connection cleanly and returns to the online menu.
             self.leave_party()
-        elif state in ("settings", "customize"):
+        elif state in ("settings", "customize", "stadiums"):
             self.state = "menu"
         elif state == "upgrades":
             target = getattr(self, "upgrades_return_state", "menu")
@@ -8390,6 +8403,14 @@ class Game:
             self.start_penalty_shootout(standalone=True)
         elif i == 4:
             self.start_match("squad")
+        elif i == 5:
+            self.tournament_active = True
+            self.tournament_round = 1
+            self.tournament_wins = 0
+            self.tournament_losses = 0
+            self.tournament_completed = False
+            self.tournament_result = ""
+            self.start_match("bot")
 
     def events_menu(self, event):
         if event.type == pygame.MOUSEMOTION:
@@ -8406,6 +8427,9 @@ class Game:
                 self.open_customize()
             if self.upgrade_rect.collidepoint(event.pos):
                 self.open_upgrades("menu")
+            if self.stadium_select_rect.collidepoint(event.pos):
+                self.state = "stadiums"
+                self.sound.play("click")
         elif event.type == pygame.KEYDOWN:
             k = event.key
             if k == pygame.K_n:
@@ -8430,7 +8454,7 @@ class Game:
                 self.menu_selection = max(0, self.menu_selection - 1)
                 self.sound.play("click")
             elif k in (pygame.K_DOWN, pygame.K_s):
-                self.menu_selection = min(4, self.menu_selection + 1)
+                self.menu_selection = min(5, self.menu_selection + 1)
                 self.sound.play("click")
             elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self.menu_choose(self.menu_selection)
@@ -8494,23 +8518,20 @@ class Game:
                 if self.set_row_rect(i).collidepoint(event.pos):
                     self.set_sel = i
         elif event.type == pygame.FINGERDOWN:
+            # Some mobile SDL builds do not synthesize mouse-down from taps.
             pos = (int(event.x * W), int(event.y * H))
             for i in range(n):
                 r = self.set_row_rect(i)
                 if r.collidepoint(pos):
                     self.set_sel = i
-                    if self.settings_tap_cooldown <= 0:
-                        self.settings_tap_cooldown = 15.0
-                        self.settings_change(i, -1 if pos[0] < r.centerx else 1)
+                    self.settings_change(i, -1 if pos[0] < r.centerx else 1)
                     return
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for i in range(n):
                 r = self.set_row_rect(i)
                 if r.collidepoint(event.pos):
                     self.set_sel = i
-                    if self.settings_tap_cooldown <= 0:
-                        self.settings_tap_cooldown = 15.0
-                        self.settings_change(i, -1 if event.pos[0] < r.centerx else 1)
+                    self.settings_change(i, -1 if event.pos[0] < r.centerx else 1)
                     return
         elif event.type == pygame.KEYDOWN:
             k = event.key
@@ -8816,7 +8837,14 @@ class Game:
                 if self.mode == "host":
                     self.host_start_match()
                 elif self.mode != "client":
-                    self.start_match(self.mode)
+                    if self.tournament_completed:
+                        self.tournament_completed = False
+                        self.tournament_result = ""
+                        self.return_to_menu()
+                    elif self.tournament_active:
+                        self.start_match("bot")
+                    else:
+                        self.start_match(self.mode)
             elif self.highlight_menu_rect.collidepoint(event.pos):
                 if self.mode == "host":
                     self.host_to_lobby()
@@ -8887,7 +8915,14 @@ class Game:
                 return
             if self.state == "finished":
                 if k == pygame.K_SPACE:
-                    self.start_match(self.mode)
+                    if self.tournament_completed:
+                        self.tournament_completed = False
+                        self.tournament_result = ""
+                        self.return_to_menu()
+                    elif self.tournament_active:
+                        self.start_match("bot")
+                    else:
+                        self.start_match(self.mode)
                 elif k == pygame.K_h:
                     self.start_highlight_replay()
                 elif k in (pygame.K_ESCAPE, pygame.K_m):
@@ -9338,7 +9373,6 @@ class Game:
     def update(self, dt):
         self.ui_t += dt
         self.fade = max(0.0, self.fade - 7.0 * dt)
-        self.settings_tap_cooldown = max(0.0, self.settings_tap_cooldown - dt)
         self.coin_timer = max(0.0, self.coin_timer - dt)
         self.shop_message_timer = max(0.0, self.shop_message_timer - dt)
         self.shake *= 0.86 ** dt
@@ -9622,6 +9656,23 @@ class Game:
 
     def finish_match(self):
         self.award_match_rewards()
+        if self.tournament_active and self.mode == "bot":
+            if self.blue_score > self.red_score:
+                self.tournament_wins += 1
+            elif self.red_score > self.blue_score:
+                self.tournament_losses += 1
+            self.tournament_round += 1
+            if self.tournament_round > 3:
+                self.tournament_active = False
+                self.tournament_completed = True
+                if self.tournament_wins >= 2:
+                    self.tournament_result = "TOURNAMENT CHAMPION!"
+                    self.profile["coins"] += 75
+                    self.last_match_reward = "CUP CHAMPION BONUS: +75 COINS"
+                else:
+                    self.tournament_result = "TOURNAMENT COMPLETE"
+                    self.last_match_reward = "GOOD RUN! TRY THE CUP AGAIN"
+                self.save_profile()
         self.state = "finished"
         self.powerups = []
         for p in self.match_players():
@@ -9943,6 +9994,8 @@ class Game:
         self.shake = 16.0
         self.sound.play("goal")
         self.particles.append(Particle(bx, by, 0, 0, color, 20, 34, ring=True))
+        self.particles.append(Particle(bx, by, 0, 0, GOLD, 13, 28, ring=True))
+        self.particles.append(Particle(bx, by, 0, 0, WHITE, 8, 22, ring=True))
         for _ in range(80):
             angle = random.uniform(0, math.tau)
             speed = random.uniform(2, 9)
@@ -10305,6 +10358,7 @@ class Game:
         # Compact, high-contrast navigation chips along the top corners.
         nav_items = ((self.customize_rect, "KIT LAB", (255, 202, 91)),
                      (self.upgrade_rect, f"UPGRADES  {self.profile['coins']} C", (116, 238, 173)),
+                     (self.stadium_select_rect, "STADIUMS", (255, 153, 105)),
                      (self.settings_rect, "SETTINGS", (92, 215, 255)))
         for rect, label, accent in nav_items:
             hover = rect.collidepoint(pygame.mouse.get_pos())
@@ -10331,6 +10385,7 @@ class Game:
             ("ONLINE PARTY", "Create a room or join a friend's party"),
             ("PENALTY SHOOTOUTS", "Pick your shot. Beat the goalkeeper"),
             ("2V2 SQUAD", "You and an AI teammate vs a rival AI duo"),
+            ("TOURNAMENT", "Play a three-match cup and earn the champion title"),
         ]
         for i, (name, description) in enumerate(options):
             self.draw_button(self.menu_rects[i], self.menu_selection == i, name, description)
@@ -10548,6 +10603,61 @@ class Game:
         draw_text(screen, self.tiny_font,
                   "TAP A ROW OR USE LEFT / RIGHT TO CHANGE  •  B MUSIC  •  N SOUND EFFECTS",
                   (179, 201, 216), (W // 2, H - 24), shadow=False)
+
+    def events_stadiums(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for i, rect in enumerate(self.stadium_choice_rects):
+                if rect.collidepoint(event.pos):
+                    self.stadium_index = i
+                    self.field_surface = None
+                    self.sound.play("click")
+                    self.state = "menu"
+                    break
+        elif event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.state = "menu"
+            elif event.key in (pygame.K_LEFT, pygame.K_a):
+                self.stadium_index = (self.stadium_index - 1) % 4
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                self.stadium_index = (self.stadium_index + 1) % 4
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.field_surface = None
+                self.state = "menu"
+
+    def draw_stadiums(self):
+        self.draw_menu_bg()
+        draw_text(screen, self.big_font, "CHOOSE YOUR STADIUM", WHITE, (W // 2, 105))
+        draw_text(screen, self.small_font, "SELECT AN ARENA FOR YOUR NEXT MATCH",
+                  (190, 215, 232), (W // 2, 153), shadow=False)
+        colors = ((40, 190, 255), (255, 151, 91), (132, 213, 255), (111, 207, 111))
+        subtitles = ("NEON LIGHTS  ·  ELECTRIC NIGHT", "WARM SUNSET  ·  COASTAL CROWD",
+                     "ICE BLUE  ·  FROSTED DOME", "WILD GREEN  ·  JUNGLE CROWD")
+        for i, rect in enumerate(self.stadium_choice_rects):
+            selected = i == self.stadium_index
+            accent = colors[i]
+            pygame.draw.rect(screen, (4, 9, 18), rect.move(0, 6), border_radius=18)
+            pygame.draw.rect(screen, (15, 29, 44), rect, border_radius=18)
+            preview = rect.inflate(-14, -14)
+            pygame.draw.rect(screen, accent, preview, 2 if selected else 1, border_radius=13)
+            pygame.draw.rect(screen, (10, 37, 48), (preview.left + 8, preview.top + 12,
+                                                    preview.w - 16, 90), border_radius=8)
+            turf = ((27, 133, 67), (68, 147, 72), (43, 126, 143), (48, 129, 54))[i]
+            pygame.draw.rect(screen, turf, (preview.left + 18, preview.top + 29,
+                                            preview.w - 36, 56), border_radius=5)
+            pygame.draw.line(screen, (235, 245, 245), (preview.centerx, preview.top + 29),
+                             (preview.centerx, preview.top + 85), 2)
+            pygame.draw.ellipse(screen, (235, 245, 245),
+                                (preview.centerx - 18, preview.top + 43, 36, 28), 2)
+            for lx in (preview.left + 24, preview.right - 24):
+                pygame.draw.circle(screen, accent, (lx, preview.top + 20), 5)
+            draw_text(screen, self.menu_font, self.stadium_names[i], WHITE,
+                      (rect.centerx, rect.top + 128), shadow=False)
+            draw_text(screen, self.tiny_font, subtitles[i], accent,
+                      (rect.centerx, rect.bottom - 20), shadow=False)
+            if selected:
+                pygame.draw.rect(screen, accent, rect, 3, border_radius=18)
+        draw_text(screen, self.small_font, "CLICK AN ARENA  ·  ARROW KEYS TO BROWSE  ·  ESC TO BACK",
+                  WHITE, (W // 2, H - 42), shadow=False)
 
     def draw_online_menu(self):
         t = self.menu_t
@@ -10829,17 +10939,28 @@ class Game:
     def build_field_surface(self):
         """Build a raised, perspective pitch with stadium lighting and 3D edging."""
         surf = pygame.Surface((W, H))
-        surf.fill((5, 13, 23))
+        stadium_palettes = (
+            {"bg": (5, 13, 23), "pitch": (10, 72, 43), "stripe_a": (38, 139, 63),
+             "stripe_b": (25, 111, 51), "side": (13, 48, 40), "crowd": ((40,140,220),(80,195,255),(235,85,70),(245,200,70))},
+            {"bg": (35, 15, 23), "pitch": (18, 91, 53), "stripe_a": (69, 155, 77),
+             "stripe_b": (37, 112, 62), "side": (77, 43, 36), "crowd": ((255,145,80),(255,205,120),(70,155,210),(240,235,210))},
+            {"bg": (7, 19, 37), "pitch": (20, 78, 91), "stripe_a": (55, 150, 166),
+             "stripe_b": (27, 104, 128), "side": (15, 49, 76), "crowd": ((130,210,255),(225,245,255),(90,130,190),(170,190,220))},
+            {"bg": (5, 25, 18), "pitch": (23, 83, 40), "stripe_a": (67, 142, 52),
+             "stripe_b": (31, 101, 43), "side": (20, 58, 32), "crowd": ((90,190,95),(225,190,80),(80,155,125),(235,235,205))},
+        )
+        palette = stadium_palettes[getattr(self, "stadium_index", 0) % len(stadium_palettes)]
+        surf.fill(palette["bg"])
 
         # Deep stadium bowl and subtle horizontal light bands.
         for y in range(H):
             k = y / max(1, H - 1)
-            col = (int(5 + 5 * k), int(13 + 9 * k), int(24 + 16 * k))
+            base = palette["bg"]
+            col = tuple(int(v * (0.78 + 0.45 * k)) for v in base)
             pygame.draw.line(surf, col, (0, y), (W, y))
 
         crowd = random.Random(22)
-        crowd_pal = [(40, 140, 220), (80, 195, 255), (235, 85, 70),
-                     (245, 200, 70), (230, 240, 250), (90, 110, 145)]
+        crowd_pal = list(palette["crowd"]) + [(230, 240, 250), (90, 110, 145)]
         # Spectator stands are visible above and below the pitch.
         stand_bands = [(0, FIELD_TOP - 2), (FIELD_BOTTOM + 3, H)]
         for top, bottom in stand_bands:
@@ -10871,16 +10992,16 @@ class Game:
         pygame.draw.polygon(surf, (1, 5, 10), shadow_poly)
         side_poly = [tl, tr, (tr[0] + 2, tr[1] + 12), (br[0] + 2, br[1] + 18),
                      (bl[0] - 2, bl[1] + 18), (tl[0] - 2, tl[1] + 12)]
-        pygame.draw.polygon(surf, (13, 48, 40), side_poly)
+        pygame.draw.polygon(surf, palette["side"], side_poly)
         pitch_poly = [tl, tr, br, bl]
-        pygame.draw.polygon(surf, (10, 72, 43), pitch_poly)
+        pygame.draw.polygon(surf, palette["pitch"], pitch_poly)
 
         # Alternating turf bands taper with the pitch to reinforce perspective.
         stripe_count = 10
         for i in range(stripe_count):
             ya = FIELD_TOP + FIELD_RECT.height * i / stripe_count
             yb = FIELD_TOP + FIELD_RECT.height * (i + 1) / stripe_count
-            col = (38, 139, 63) if i % 2 == 0 else (25, 111, 51)
+            col = palette["stripe_a"] if i % 2 == 0 else palette["stripe_b"]
             poly = [project_field_point(FIELD_LEFT, ya),
                     project_field_point(FIELD_RIGHT, ya),
                     project_field_point(FIELD_RIGHT, yb),
@@ -11060,6 +11181,8 @@ class Game:
 
     def draw_hud(self):
         online = self.mode in ("host", "client")
+        draw_text(screen, self.tiny_font, self.stadium_names[self.stadium_index],
+                  (180, 205, 220), (W // 2, 82), shadow=False)
         panel = pygame.Rect(W // 2 - 225, 8, 450, 64)
         pygame.draw.rect(screen, UI, panel, border_radius=16)
         pygame.draw.rect(screen, UI_LIGHT, panel, 2, border_radius=16)
@@ -11670,6 +11793,12 @@ class Game:
             self.draw_fade()
             pygame.display.flip()
             return
+        if self.state == "stadiums":
+            self.draw_stadiums()
+            self.draw_back_button()
+            self.draw_fade()
+            pygame.display.flip()
+            return
         if self.state == "settings":
             self.draw_settings()
             self.draw_back_button()
@@ -11696,6 +11825,17 @@ class Game:
             return
         if self.state == "finished":
             self.draw_match_highlights()
+            if self.tournament_active or self.tournament_completed:
+                label = f"CUP MATCH {min(3, self.tournament_round - 1)} / 3   ·   WINS {self.tournament_wins}"
+                draw_text(screen, self.small_font, label, GOLD, (W // 2, 112), shadow=True)
+                if self.tournament_completed:
+                    draw_text(screen, self.big_font, self.tournament_result, GOLD,
+                              (W // 2, 160), shadow=True)
+                    draw_text(screen, self.tiny_font, "PRESS SPACE TO RETURN TO MENU",
+                              WHITE, (W // 2, 205), shadow=False)
+                else:
+                    draw_text(screen, self.tiny_font, "PRESS SPACE FOR THE NEXT CUP MATCH",
+                              WHITE, (W // 2, 160), shadow=False)
             self.draw_back_button()
             self.draw_fade()
             pygame.display.flip()
